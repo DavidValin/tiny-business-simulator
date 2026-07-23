@@ -1,0 +1,4 @@
++ Beer : 2.7 USD : 0.2 mins
+  - 0.27 USD labor
+  - 0.32 USD beer
+  - 0.10 USD cleaning

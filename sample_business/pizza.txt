@@ -1,0 +1,8 @@
++ Pizza (ham and cheese) : 12 USD : 1 mins
+  - 0.10 USD labor
+  - 0.47 USD base
+  - 0.10 USD tomatoe
+  - 0.37 USD cheese
+  - 0.80 USD ham
+  - 0.42 USD onion
+  - 0.10 USD cleaning

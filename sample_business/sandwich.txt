@@ -1,0 +1,6 @@
++ Sandwich : 5.75 USD : 8 mins
+  - 0.80 USD bread
+  - 1.20 USD ham
+  - 0.45 USD cheese
+  - 0.25 USD lettuce
+  - 0.10 USD cleaning

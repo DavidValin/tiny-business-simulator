@@ -1,0 +1,6 @@
++ Smoothie : 5.40 USD : 5 mins
+  - 1.10 USD strawberries
+  - 0.80 USD banana
+  - 0.40 USD yogurt
+  - 0.20 USD plastic cup
+  - 0.10 USD cleaning

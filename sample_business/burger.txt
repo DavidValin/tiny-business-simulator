@@ -1,0 +1,8 @@
++ American burger : 16 USD : 12 mins
+  - 3 USD beef
+  - 0.20 USD lettuce
+  - 0.47 USD tomato
+  - 0.15 USD cheese
+  - 0.90 USD potatoes
+  - 0.4 USD ketchup
+  - 0.10 USD cleaning

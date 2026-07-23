@@ -11,7 +11,7 @@ Simulate your next business simply by defining a .txt file for each product in w
   - 0.10 USD cleaning costs
 ```
 
-![preview](https://github.com/DavidValin/tiny-business-simulator/raw/master/preview.png)
+![preview](https://github.com/DavidValin/tiny-business-simulator/raw/master/preview.gif)
 
 #### Features
 

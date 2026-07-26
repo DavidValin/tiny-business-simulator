@@ -49,7 +49,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -93,6 +93,10 @@ struct Slider {
     step: i64,
     /// Suffix appended to the numeric readout (e.g. "%", " h", "").
     suffix: &'static str,
+    /// For product-percentage sliders: when true this product's % is frozen and
+    /// is excluded from the redistribution triggered by changing another
+    /// product's %. Ignored for non-percent sliders.
+    locked: bool,
 }
 
 impl Slider {
@@ -958,15 +962,17 @@ fn frac_char(f: f64) -> Option<char> {
 }
 
 
-/// A textual slider track filled proportionally to the value.
-fn slider_track(s: &Slider) -> String {
-    const W: usize = 10;
+/// A textual slider track `width` cells wide, filled proportionally to the
+/// value.  `width` is clamped to at least 1 so a degenerate column still shows
+/// a single-cell track.
+fn slider_track(s: &Slider, width: usize) -> String {
+    let w = width.max(1);
     let span = (s.max - s.min).max(1) as f64;
     let frac = (s.value - s.min) as f64 / span;
-    let filled = (frac * W as f64).round() as usize;
-    let filled = filled.min(W);
-    let mut out = String::with_capacity(W);
-    for i in 0..W {
+    let filled = (frac * w as f64).round() as usize;
+    let filled = filled.min(w);
+    let mut out = String::with_capacity(w);
+    for i in 0..w {
         if i < filled {
             out.push('\u{2588}');
         } else {
@@ -976,21 +982,146 @@ fn slider_track(s: &Slider) -> String {
     out
 }
 
-/// Lines for one slider entry (header + track + blank).
-fn slider_entry_lines(s: &Slider, focused: bool) -> Vec<Line<'static>> {
+/// Lines for one slider entry (header + track + blank).  When the slider is a
+/// product-percentage slider, a right-aligned "[x] lock values" / "[ ] lock
+/// values" checkbox is appended to the header line within `width` cells, so it
+/// sits on the same line as the product name, flush against the panel's right
+/// border.  `width` is the inner (border-excluded) width of the panel that will
+/// render these lines; pass 0 to suppress the checkbox (e.g. when the width is
+/// unknown).
+fn slider_entry_lines(s: &Slider, focused: bool, width: u16) -> Vec<Line<'static>> {
     let marker = if focused { "\u{25b6} " } else { "  " };
     let label_style = if focused {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
+    let is_percent = matches!(s.kind, SliderKind::Percent(_));
+
+    // Settings sliders (non-percent): wrap the label after the first word (the
+    // first word on its own header line, the remaining words wrapped to the
+    // column width), left-aligned.  Product-percentage sliders keep their
+    // single-line header with the right-aligned "lock values" checkbox.
+    if !is_percent {
+        return settings_entry_lines(s, focused, width, marker, label_style);
+    }
+
+    // Header line: marker + label (the "lock values" checkbox moves to the
+    // track line below, right-aligned within `width`).
+    let mut header_spans: Vec<Span<'static>> = Vec::new();
+    header_spans.push(Span::styled(marker.to_string(), label_style));
+    header_spans.push(Span::styled(s.label.clone(), label_style));
+
     let mut lines = Vec::new();
+    lines.push(Line::from(header_spans));
+    let readout = format!(" {}{}", s.value, s.suffix);
+    // Track width: prefer 10 cells, but shrink to whatever room is left after
+    // the 2-cell indent and the readout so the track + readout never wraps to
+    // a second line in a narrow column.
+    let indent_w = 2usize;
+    let readout_w = readout.chars().count();
+    let max_track = 10usize;
+    let avail_for_track = (width as usize).saturating_sub(indent_w + readout_w);
+    let track_w = avail_for_track.clamp(1, max_track);
+    let track = slider_track(s, track_w);
+    let track_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    // Build the track line: indent + track + readout, optionally followed by
+    // a right-aligned "[x] lock values" / "[ ] lock values" checkbox for
+    // product-percentage sliders.
+    let mut track_spans: Vec<Span<'static>> = Vec::new();
+    track_spans.push(Span::raw("  "));
+    track_spans.push(Span::styled(track, track_style));
+    track_spans.push(Span::styled(readout, label_style));
+
+    if is_percent && width > 0 {
+        let box_str = if s.locked { "[x]" } else { "[ ]" };
+        let lock_label = " lock values";
+        let needed = box_str.chars().count() + lock_label.chars().count();
+        let used = indent_w + track_w + readout_w;
+        let avail = (width as usize).saturating_sub(used);
+        if avail >= needed {
+            let pad = avail - needed;
+            let box_style = if s.locked {
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else if focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let label_style_cb = if s.locked {
+                Style::default().fg(Color::Green)
+            } else if focused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            track_spans.push(Span::raw(" ".repeat(pad)));
+            track_spans.push(Span::styled(box_str.to_string(), box_style));
+            track_spans.push(Span::styled(lock_label.to_string(), label_style_cb));
+        }
+    }
+
+    lines.push(Line::from(track_spans));
+    lines.push(Line::from(""));
+    lines
+}
+
+/// Lines for a Settings (non-percent) slider entry.  The label is split after
+/// the first word: the first word goes on its own header line (with the focus
+/// marker), the remaining words are word-wrapped to the column width, all
+/// left-aligned.  The track + readout line follows.  A trailing blank line
+/// separates entries.
+fn settings_entry_lines(
+    s: &Slider,
+    focused: bool,
+    width: u16,
+    marker: &str,
+    label_style: Style,
+) -> Vec<Line<'static>> {
+    let w = width as usize;
+
+    // Split the label into the first word and the remainder.
+    let (first, rest) = match s.label.find(' ') {
+        Some(i) => (s.label[..i].to_string(), s.label[i + 1..].trim().to_string()),
+        None => (s.label.clone(), String::new()),
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Header line: marker + first word, left-aligned.
     lines.push(Line::from(vec![
         Span::styled(marker.to_string(), label_style),
-        Span::styled(s.label.clone(), label_style),
+        Span::styled(first, label_style),
     ]));
-    let track = slider_track(s);
+
+    // Remaining words, word-wrapped to `w` and each line left-aligned.  Indent
+    // each wrapped line by the marker width so it aligns with the first word
+    // on the header line (rather than starting at the column's left edge).
+    let marker_w = marker.chars().count();
+    let indent: String = " ".repeat(marker_w);
+    let wrap_w = w.saturating_sub(marker_w).max(1);
+    if !rest.is_empty() {
+        for chunk in word_wrap(&rest, wrap_w) {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(chunk, label_style),
+            ]));
+        }
+    }
+
+    // Track + readout line, left-aligned (2-space indent + track + readout).
     let readout = format!(" {}{}", s.value, s.suffix);
+    let indent_w = 2usize;
+    let readout_w = readout.chars().count();
+    let max_track = 10usize;
+    let avail_for_track = w.saturating_sub(indent_w + readout_w);
+    let track_w = avail_for_track.clamp(1, max_track);
+    let track = slider_track(s, track_w);
     let track_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -1005,15 +1136,85 @@ fn slider_entry_lines(s: &Slider, focused: bool) -> Vec<Line<'static>> {
     lines
 }
 
+/// Greedy word-wrap `text` to lines of at most `width` display cells, breaking
+/// at spaces.  A single word longer than `width` is hard-split at `width`.
+fn word_wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let word_w = lang::str_width(word);
+        if cur.is_empty() {
+            if word_w <= width {
+                cur.push_str(word);
+            } else {
+                // Hard-split an over-long word.
+                let mut s = word;
+                while lang::str_width(s) > width {
+                    let mut take = 0usize;
+                    let mut wlen = 0usize;
+                    for (i, c) in s.char_indices() {
+                        let cw = lang::str_width(&c.to_string());
+                        if wlen + cw > width {
+                            break;
+                        }
+                        wlen += cw;
+                        take = i + c.len_utf8();
+                    }
+                    lines.push(s[..take].to_string());
+                    s = &s[take..];
+                }
+                cur.push_str(s);
+            }
+        } else if lang::str_width(&cur) + 1 + word_w <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            if word_w <= width {
+                cur.push_str(word);
+            } else {
+                let mut s = word;
+                while lang::str_width(s) > width {
+                    let mut take = 0usize;
+                    let mut wlen = 0usize;
+                    for (i, c) in s.char_indices() {
+                        let cw = lang::str_width(&c.to_string());
+                        if wlen + cw > width {
+                            break;
+                        }
+                        wlen += cw;
+                        take = i + c.len_utf8();
+                    }
+                    lines.push(s[..take].to_string());
+                    s = &s[take..];
+                }
+                cur.push_str(s);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Lines for a range of slider entries (no header — the surrounding `Block`
 /// title serves as the header).  `start..end` are indices into
 /// `state.sliders`; the focused entry (`state.selected`) is highlighted.
-fn build_slider_lines(state: &AppState, start: usize, end: usize) -> Vec<Line<'static>> {
+/// `width` is the inner (border-excluded) width of the rendering panel, used
+/// to right-align the per-product "lock values" checkbox.
+fn build_slider_lines(state: &AppState, start: usize, end: usize, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let end = end.min(state.sliders.len());
     for i in start..end {
         let s = &state.sliders[i];
-        lines.extend(slider_entry_lines(s, i == state.selected));
+        lines.extend(slider_entry_lines(s, i == state.selected, width));
     }
     lines
 }
@@ -1022,28 +1223,74 @@ fn build_slider_lines(state: &AppState, start: usize, end: usize) -> Vec<Line<'s
 /// written to `totals.simulation_results.txt` (monthly + annual sales, time in
 /// minutes/hours, workdays, plus the workday/parallel settings), followed by
 /// the 12 x monthly vs yearly-goal reference.
+#[allow(dead_code)]
 fn build_totals_lines(state: &AppState) -> Vec<Line<'static>> {
+    let (left, right) = build_totals_columns(state);
+    let mut lines = left;
+    lines.extend(right);
+    lines
+}
+
+/// Build the two Totals columns as separate line vectors so the renderer can
+/// place them side by side.  Left column: Monthly + Settings.  Right column:
+/// Yearly + Yearly ref.  Each column is self-contained and wraps to its own
+/// width when rendered with `Paragraph::wrap`.  Labels are kept short so they
+/// fit narrow columns without wrapping the value onto its own line.
+fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let t = compute_totals(state);
-
     let sub = Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let val = Style::default();
 
-    lines.push(Line::from(Span::styled("Monthly", sub)));
-    lines.push(Line::from(format!("  sales    {}", t.monthly.sales)));
-    lines.push(Line::from(format!("  time     {:.0} min", t.monthly.minutes)));
-    lines.push(Line::from(format!("  hours    {:.1}", t.monthly.hours)));
-    lines.push(Line::from(format!("  workdays {:.2}", t.monthly.workdays)));
+    // --- Left column: Monthly + Settings ---
+    let mut left: Vec<Line<'static>> = Vec::new();
+    left.push(Line::from(Span::styled("Monthly", sub)));
+    left.push(Line::from(vec![
+        Span::styled("  sales    ", val),
+        Span::styled(format!("{}", t.monthly.sales), val),
+    ]));
+    left.push(Line::from(vec![
+        Span::styled("  min      ", val),
+        Span::styled(format!("{:.0}", t.monthly.minutes), val),
+    ]));
+    left.push(Line::from(vec![
+        Span::styled("  hours    ", val),
+        Span::styled(format!("{:.1}", t.monthly.hours), val),
+    ]));
+    left.push(Line::from(vec![
+        Span::styled("  workdays ", val),
+        Span::styled(format!("{:.2}", t.monthly.workdays), val),
+    ]));
+    left.push(Line::from(""));
+    left.push(Line::from(Span::styled("Settings", sub)));
+    left.push(Line::from(vec![
+        Span::styled("  workday  ", val),
+        Span::styled(format!("{} h", t.workday_hours), val),
+    ]));
+    left.push(Line::from(vec![
+        Span::styled("  parallel ", val),
+        Span::styled(format!("{}", t.parallel), val),
+    ]));
 
-    lines.push(Line::from(Span::styled("Yearly", sub)));
-    lines.push(Line::from(format!("  sales    {}", t.annual.sales)));
-    lines.push(Line::from(format!("  time     {:.0} min", t.annual.minutes)));
-    lines.push(Line::from(format!("  hours    {:.1}", t.annual.hours)));
-    lines.push(Line::from(format!("  workdays {:.2}", t.annual.workdays)));
-
-    lines.push(Line::from(Span::styled("Settings", sub)));
-    lines.push(Line::from(format!("  workday  {} h", t.workday_hours)));
-    lines.push(Line::from(format!("  parallel {}", t.parallel)));
-
+    // --- Right column: Yearly + Yearly ref ---
+    let mut right: Vec<Line<'static>> = Vec::new();
+    right.push(Line::from(Span::styled("Yearly", sub)));
+    right.push(Line::from(vec![
+        Span::styled("  sales    ", val),
+        Span::styled(format!("{}", t.annual.sales), val),
+    ]));
+    right.push(Line::from(vec![
+        Span::styled("  min      ", val),
+        Span::styled(format!("{:.0}", t.annual.minutes), val),
+    ]));
+    right.push(Line::from(vec![
+        Span::styled("  hours    ", val),
+        Span::styled(format!("{:.1}", t.annual.hours), val),
+    ]));
+    right.push(Line::from(vec![
+        Span::styled("  workdays ", val),
+        Span::styled(format!("{:.2}", t.annual.workdays), val),
+    ]));
+    right.push(Line::from(""));
     // Yearly reference: 12 x monthly goal vs the yearly goal slider.
     let monthly = state.slider_value(SliderKind::MonthlyGoal);
     let yearly_target = state.slider_value(SliderKind::YearlyGoal);
@@ -1053,15 +1300,18 @@ fn build_totals_lines(state: &AppState) -> Vec<Line<'static>> {
     } else {
         ("\u{2716}", Style::default().fg(Color::Red))
     };
-    lines.push(Line::from(Span::styled("Yearly ref", sub)));
-    lines.push(Line::from(format!("  12x mo   {}", year_sum)));
-    lines.push(Line::from(vec![
+    right.push(Line::from(Span::styled("Yearly ref", sub)));
+    right.push(Line::from(vec![
+        Span::styled("  12x mo   ", val),
+        Span::styled(format!("{}", year_sum), val),
+    ]));
+    right.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(mark.to_string(), mark_style),
-        Span::raw(format!(" goal  {}", yearly_target)),
+        Span::styled(format!(" goal  {}", yearly_target), val),
     ]));
 
-    lines
+    (left, right)
 }
 
 fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
@@ -1096,22 +1346,80 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     //   2. Settings  — workday hours, parallel, monthly & yearly goals
     //   3. Totals    — every aggregate value (also written to the totals file)
     let sidebar_area = body_chunks[1];
+    let n_percent = state.products.len();
+    let total_sliders = state.sliders.len();
+
+    // Desired dynamic inner padding for every sidebar region: scales with the
+    // sidebar width so wider terminals get more breathing room (0..=4 cells).
+    let sidebar_inner_w = sidebar_area.width.saturating_sub(2) as usize;
+    let desired_pad = ((sidebar_inner_w / 12) as u16).min(4);
+
+    // The Settings region height is content-driven: just enough to fit its
+    // wrapped lines + border + padding (clamped to a 7-row minimum so the title
+    // and a couple of lines always show).  Totals is fixed at 13 rows.  Products
+    // (Min) absorbs ALL remaining vertical space, so resizing the terminal
+    // taller grows Products, not Settings.
+    let totals_region_h: u16 = 13;
+    let settings_min_h: u16 = 7;
+
+    // Products: each entry is 3 lines (header + track + blank).
+    let products_needed = (n_percent * 3) as u16;
+
+    // Settings: build the actual wrapped lines for both columns and take the
+    // taller one.  The column width depends on the padding, but the line count
+    // only grows when the column is narrower (more wrapping), so compute it
+    // with the *desired* padding width first; if that doesn't fit we reduce the
+    // padding below, which only makes columns wider (fewer wraps), so the
+    // estimate is conservative.
+    let settings_inner_w = sidebar_inner_w;
+    let settings_col_w = settings_inner_w
+        .saturating_sub(1 /* separator */ + desired_pad as usize * 2) / 2;
+    let mid = (n_percent + 2).min(total_sliders);
+    let settings_left_lines = build_slider_lines(state, n_percent, mid, settings_col_w as u16);
+    let settings_right_lines = build_slider_lines(state, mid, total_sliders, settings_col_w as u16);
+    let settings_needed = settings_left_lines.len().max(settings_right_lines.len()) as u16;
+
+    // Totals: both columns have the same fixed structure (9 lines each).
+    let (totals_left, totals_right) = build_totals_columns(state);
+    let totals_needed = totals_left.len().max(totals_right.len()) as u16;
+
+    // Compute the padding each region can afford at a few candidate padding
+    // values, and pick the largest padding that lets every region fit all its
+    // rows.  Settings height grows with the padding (so the padding is real,
+    // not clipped); Products and Totals are clamped by their available height.
+    // Try from the desired padding down to 0.
+    let mut sidebar_pad: u16 = 0;
+    let mut settings_region_h: u16 = settings_min_h;
+    for &p in (0..=desired_pad).rev().collect::<Vec<_>>().iter() {
+        let s_h = (2 + settings_needed + p * 2).max(settings_min_h);
+        let products_available = sidebar_area
+            .height
+            .saturating_sub(s_h + totals_region_h);
+        let products_max_pad = products_available
+            .saturating_sub(2 + products_needed) / 2;
+        let totals_max_pad = totals_region_h
+            .saturating_sub(2 + totals_needed) / 2;
+        if p <= products_max_pad && p <= totals_max_pad {
+            sidebar_pad = p;
+            settings_region_h = s_h;
+            break;
+        }
+    }
+
     let sidebar_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Length(14),
-            Constraint::Length(20),
+            Constraint::Length(settings_region_h),
+            Constraint::Length(totals_region_h),
         ])
         .split(sidebar_area);
 
-    let n_percent = state.products.len();
-    let total_sliders = state.sliders.len();
-
     // --- Region 1: Products (scrollable) ---
     let top_area = sidebar_chunks[0];
-    // Inner height minus the 2-cell border. Each entry is 3 lines.
-    let top_inner_h = top_area.height.saturating_sub(2) as usize;
+    // Inner area minus the 2-cell border and the dynamic sidebar padding on
+    // all sides. Each entry is 3 lines.
+    let top_inner_h = top_area.height.saturating_sub(2 + sidebar_pad * 2) as usize;
     let entry_h = 3usize;
     let visible_entries = (top_inner_h / entry_h).max(1);
     // Auto-scroll only while focus is inside the products range.
@@ -1127,7 +1435,8 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
     let start = state.scroll;
     let end = (start + visible_entries).min(n_percent);
-    let product_lines = build_slider_lines(state, start, end);
+    let top_inner_w = top_area.width.saturating_sub(2 + sidebar_pad * 2);
+    let product_lines = build_slider_lines(state, start, end, top_inner_w);
     let sidebar_active = state.active_region == Region::Sidebar;
     let products_block = Block::default()
         .borders(Borders::ALL)
@@ -1138,7 +1447,16 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         } else {
             Style::default()
         });
-    frame.render_widget(Paragraph::new(product_lines).block(products_block), top_area);
+    frame.render_widget(products_block, top_area);
+    // Render the content inset by the border (1) + dynamic padding on all
+    // sides so the sliders get more breathing room on wider terminals.
+    let products_content = Rect::new(
+        top_area.x + 1 + sidebar_pad,
+        top_area.y + 1 + sidebar_pad,
+        top_inner_w,
+        top_inner_h as u16,
+    );
+    frame.render_widget(Paragraph::new(product_lines), products_content);
 
     // Scroll indicators for the products region: an up-arrow at the top edge
     // when entries are scrolled off above, and a down-arrow at the bottom edge
@@ -1163,26 +1481,137 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     // --- Region 2: Settings (workday, parallel, monthly & yearly goals) ---
-    let settings_lines = build_slider_lines(state, n_percent, total_sliders);
+    // Two internal columns separated by a 1-cell vertical rule, each holding
+    // two of the four settings sliders so the region is compact.  Labels wrap
+    // to the column width via Paragraph's Wrap, and the track shrinks to fit
+    // so the track + readout stays on one line.
     let settings_block = Block::default()
         .borders(Borders::ALL)
         .title("Settings")
-        .title_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(
-        Paragraph::new(settings_lines).block(settings_block),
-        sidebar_chunks[1],
-    );
+        .title_style(Style::default().add_modifier(Modifier::BOLD))
+        .border_style(if sidebar_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let settings_inner = settings_block.inner(sidebar_chunks[1]);
+    frame.render_widget(settings_block, sidebar_chunks[1]);
+    if settings_inner.height > 0 && settings_inner.width >= 3 {
+        // [left col | 1-cell rule | right col].  Min(1) on the sides lets the
+        // Length(1) middle win its exact 1 cell and the rest splits evenly.
+        let settings_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .horizontal_margin(0)
+            .split(settings_inner);
+        let left_area = settings_cols[0];
+        let sep_area = settings_cols[1];
+        let right_area = settings_cols[2];
+
+        // Draw the vertical separator rule down the middle column.
+        let sep_style = Style::default().fg(Color::DarkGray);
+        let buf = frame.buffer_mut();
+        for y in sep_area.top()..sep_area.bottom() {
+            if y < buf.area.height {
+                buf.set_string(sep_area.x, y, "\u{2502}", sep_style);
+            }
+        }
+
+        // Left column: first two settings sliders; right column: the next two.
+        // Each column is inset by the dynamic sidebar padding on all sides
+        // (left, right, top, bottom) for a uniform inner margin that grows with
+        // the terminal width.
+        let pad = sidebar_pad;
+        let left_inner = Rect::new(
+            left_area.x + pad,
+            left_area.y + pad,
+            left_area.width.saturating_sub(pad * 2),
+            left_area.height.saturating_sub(pad * 2),
+        );
+        let right_inner = Rect::new(
+            right_area.x + pad,
+            right_area.y + pad,
+            right_area.width.saturating_sub(pad * 2),
+            right_area.height.saturating_sub(pad * 2),
+        );
+        let mid = (n_percent + 2).min(total_sliders);
+        let left_lines = build_slider_lines(state, n_percent, mid, left_inner.width);
+        let right_lines = build_slider_lines(state, mid, total_sliders, right_inner.width);
+        frame.render_widget(
+            Paragraph::new(left_lines).wrap(Wrap { trim: false }),
+            left_inner,
+        );
+        frame.render_widget(
+            Paragraph::new(right_lines).wrap(Wrap { trim: false }),
+            right_inner,
+        );
+    }
 
     // --- Region 3: Totals ---
-    let totals_lines = build_totals_lines(state);
+    // Two internal columns separated by a 1-cell vertical rule, mirroring the
+    // Settings region.  Left: Monthly + Settings; Right: Yearly + Yearly ref.
     let bottom_block = Block::default()
         .borders(Borders::ALL)
         .title("Totals")
-        .title_style(Style::default().add_modifier(Modifier::BOLD));
-    frame.render_widget(
-        Paragraph::new(totals_lines).block(bottom_block).alignment(Alignment::Left),
-        sidebar_chunks[2],
-    );
+        .title_style(Style::default().add_modifier(Modifier::BOLD))
+        .border_style(if sidebar_active {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        });
+    let totals_inner = bottom_block.inner(sidebar_chunks[2]);
+    frame.render_widget(bottom_block, sidebar_chunks[2]);
+    if totals_inner.height > 0 && totals_inner.width >= 3 {
+        let totals_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(totals_inner);
+        let left_area = totals_cols[0];
+        let sep_area = totals_cols[1];
+        let right_area = totals_cols[2];
+
+        // Vertical separator rule down the middle column.
+        let sep_style = Style::default().fg(Color::DarkGray);
+        let buf = frame.buffer_mut();
+        for y in sep_area.top()..sep_area.bottom() {
+            if y < buf.area.height {
+                buf.set_string(sep_area.x, y, "\u{2502}", sep_style);
+            }
+        }
+
+        // Each column is inset by the dynamic sidebar padding on all sides,
+        // mirroring the Settings region.
+        let pad = sidebar_pad;
+        let left_inner = Rect::new(
+            left_area.x + pad,
+            left_area.y + pad,
+            left_area.width.saturating_sub(pad * 2),
+            left_area.height.saturating_sub(pad * 2),
+        );
+        let right_inner = Rect::new(
+            right_area.x + pad,
+            right_area.y + pad,
+            right_area.width.saturating_sub(pad * 2),
+            right_area.height.saturating_sub(pad * 2),
+        );
+        let (left_lines, right_lines) = build_totals_columns(state);
+        frame.render_widget(
+            Paragraph::new(left_lines).wrap(Wrap { trim: false }),
+            left_inner,
+        );
+        frame.render_widget(
+            Paragraph::new(right_lines).wrap(Wrap { trim: false }),
+            right_inner,
+        );
+    }
 
     let region_name = match state.active_region {
         Region::Main => "main",
@@ -1190,11 +1619,11 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     };
     let footer_text = match &state.status {
         Some(msg) => format!(
-            "{}   |   region: {}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Ctrl+E export   q quit",
+            "{}   |   region: {}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Space lock   Ctrl+E export   q quit",
             msg, region_name
         ),
         None => format!(
-            "region: {}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Ctrl+E export   q quit",
+            "region: {}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Space lock   Ctrl+E export   q quit",
             region_name
         ),
     };
@@ -1210,13 +1639,14 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
 // Event loop
 // ---------------------------------------------------------------------------
 
-/// Set the percentage slider at `changed_idx` to `new_value` (clamped to
-/// 0..=100) and distribute the remaining `100 - new_value` **equally** across
-/// the other product-percentage sliders whose current value is greater than
-/// zero. Products already at 0% are left at 0% (they opt out of the split until
-/// the user raises them). Rounding drift is corrected so the post-state sum is
-/// exactly 100 whenever at least one other product is eligible. Non-percent
-/// sliders are left untouched.
+/// Set the percentage slider at `changed_idx` to `new_value` (clamped to a
+/// range that respects the locked products) and distribute the remaining
+/// percentage **equally** across the other **non-locked** product-percentage
+/// sliders whose current value is greater than zero. Locked products keep their
+/// exact value and never receive any redistributed share. Products already at
+/// 0% are left at 0% (they opt out of the split until the user raises them).
+/// Rounding drift is corrected so the post-state sum is exactly 100 whenever at
+/// least one other product is eligible. Non-percent sliders are left untouched.
 fn redistribute_percent(sliders: &mut [Slider], changed_idx: usize, new_value: i64) {
     let target = match sliders.get(changed_idx).and_then(|s| match s.kind {
         SliderKind::Percent(p) => Some(p),
@@ -1225,18 +1655,23 @@ fn redistribute_percent(sliders: &mut [Slider], changed_idx: usize, new_value: i
         Some(p) => p,
         None => return,
     };
-    let v = new_value.clamp(0, 100);
-
-    // Indices of the OTHER product-percentage sliders, split by whether they
-    // are currently eligible (value > 0) to receive a share of the remainder.
-    let mut eligible: Vec<usize> = Vec::new();
-    for (i, s) in sliders.iter().enumerate() {
-        if let SliderKind::Percent(p) = s.kind {
-            if p != target && s.value > 0 {
-                eligible.push(i);
-            }
-        }
+    // A locked product is frozen: it cannot be moved, even by direct input.
+    if sliders[changed_idx].locked {
+        return;
     }
+
+    // Sum of the OTHER locked products' values — these are frozen and carve out
+    // a fixed chunk of the 100% pie that the changed product + the eligible
+    // non-locked products must share.
+    let locked_sum: i64 = sliders
+        .iter()
+        .filter(|s| matches!(s.kind, SliderKind::Percent(p) if p != target) && s.locked)
+        .map(|s| s.value)
+        .sum();
+
+    // The changed product cannot exceed the room left by the locked products.
+    let max_v = (100 - locked_sum).max(0);
+    let v = new_value.clamp(0, max_v);
 
     // Set the changed product first.
     for s in sliders.iter_mut() {
@@ -1245,13 +1680,23 @@ fn redistribute_percent(sliders: &mut [Slider], changed_idx: usize, new_value: i
         }
     }
 
-    let remainder = 100 - v;
-    if eligible.is_empty() {
-        // No other product can absorb the remainder; zero out the rest and
-        // leave the sum below 100 (the user must raise a 0% product to fix it).
+    // Eligible receivers: non-locked, != changed, currently > 0.
+    let mut eligible: Vec<usize> = Vec::new();
+    for (i, s) in sliders.iter().enumerate() {
+        if let SliderKind::Percent(p) = s.kind {
+            if p != target && !s.locked && s.value > 0 {
+                eligible.push(i);
+            }
+        }
+    }
+
+    let remainder = 100 - v - locked_sum;
+    if remainder <= 0 || eligible.is_empty() {
+        // No room to distribute, or no eligible receiver: zero out the
+        // non-locked, non-changed products (the locked ones keep their value).
         for s in sliders.iter_mut() {
             if let SliderKind::Percent(p) = s.kind {
-                if p != target {
+                if p != target && !s.locked {
                     s.value = 0;
                 }
             }
@@ -1333,6 +1778,15 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char(' ') => {
+            // Toggle the "lock values" checkbox of the focused product
+            // percentage slider (ignored for non-percent sliders).
+            if let Some(s) = state.sliders.get_mut(state.selected) {
+                if matches!(s.kind, SliderKind::Percent(_)) {
+                    s.locked = !s.locked;
+                }
+            }
+        }
         KeyCode::Up => {
             if state.selected == 0 {
                 state.selected = state.sliders.len() - 1;
@@ -1570,6 +2024,7 @@ fn build_sliders(products: &[(PathBuf, ProductResult)]) -> Vec<Slider> {
             max: 100,
             step: 1,
             suffix: "%",
+            locked: false,
         });
     }
     sliders.push(Slider {
@@ -1580,6 +2035,7 @@ fn build_sliders(products: &[(PathBuf, ProductResult)]) -> Vec<Slider> {
         max: 24,
         step: 1,
         suffix: " h",
+        locked: false,
     });
     sliders.push(Slider {
         kind: SliderKind::Parallel,
@@ -1589,6 +2045,7 @@ fn build_sliders(products: &[(PathBuf, ProductResult)]) -> Vec<Slider> {
         max: 200,
         step: 1,
         suffix: "",
+        locked: false,
     });
     sliders.push(Slider {
         kind: SliderKind::MonthlyGoal,
@@ -1598,6 +2055,7 @@ fn build_sliders(products: &[(PathBuf, ProductResult)]) -> Vec<Slider> {
         max: 1_000_000,
         step: 100,
         suffix: "",
+        locked: false,
     });
     sliders.push(Slider {
         kind: SliderKind::YearlyGoal,
@@ -1607,6 +2065,7 @@ fn build_sliders(products: &[(PathBuf, ProductResult)]) -> Vec<Slider> {
         max: 10_000_000,
         step: 1000,
         suffix: "",
+        locked: false,
     });
     sliders
 }
@@ -1797,6 +2256,7 @@ mod tests {
             max: 24,
             step: 1,
             suffix: "",
+            locked: false,
         };
         s.inc();
         assert_eq!(s.value, 9);
@@ -1831,8 +2291,9 @@ mod tests {
             max: 24,
             step: 1,
             suffix: "",
+            locked: false,
         };
-        let t = slider_track(&s);
+        let t = slider_track(&s, 10);
         assert_eq!(t.chars().count(), 10);
         let filled = t.chars().filter(|c| *c == '\u{2588}').count();
         assert_eq!(filled, 5);
@@ -1850,6 +2311,7 @@ mod tests {
                 max: 100,
                 step: 1,
                 suffix: "%",
+                locked: false,
             })
             .collect()
     }
@@ -1921,6 +2383,57 @@ mod tests {
     }
 
     #[test]
+    fn redistribute_freezes_locked_product_value() {
+        // A=50, B=30, C=20. Lock B at 30, then raise A to 60: the remainder 10
+        // must go ONLY to the non-locked, non-zero C (B is frozen and excluded).
+        let mut sliders = pct_sliders(&[50, 30, 20]);
+        sliders[1].locked = true;
+        redistribute_percent(&mut sliders, 0, 60);
+        let vals = pct_values(&sliders);
+        assert_eq!(vals.iter().sum::<i64>(), 100);
+        assert_eq!(vals[0], 60);
+        assert_eq!(vals[1], 30); // frozen
+        assert_eq!(vals[2], 10); // absorbed the whole remainder
+    }
+
+    #[test]
+    fn redistribute_capped_by_locked_room() {
+        // A=20, B=30, C=50. Lock B=30 and C=50 (locked_sum=80). Raise A above
+        // the available 20: it must clamp to 20 (100 - 80), not exceed it, so
+        // the sum stays exactly 100.
+        let mut sliders = pct_sliders(&[20, 30, 50]);
+        sliders[1].locked = true;
+        sliders[2].locked = true;
+        redistribute_percent(&mut sliders, 0, 90);
+        let vals = pct_values(&sliders);
+        assert_eq!(vals.iter().sum::<i64>(), 100);
+        assert_eq!(vals[0], 20); // clamped to 100 - locked_sum
+        assert_eq!(vals[1], 30); // frozen
+        assert_eq!(vals[2], 50); // frozen
+    }
+
+    #[test]
+    fn redistribute_locked_changed_slider_does_nothing() {
+        // A=50, B=50. Lock A, then try to raise A to 80: it is frozen, so
+        // nothing moves.
+        let mut sliders = pct_sliders(&[50, 50]);
+        sliders[0].locked = true;
+        redistribute_percent(&mut sliders, 0, 80);
+        assert_eq!(pct_values(&sliders), vec![50, 50]);
+    }
+
+    #[test]
+    fn redistribute_locked_zero_excluded_from_receivers() {
+        // A=50, B=50. Lock B at 50. Lower A to 20: remainder 30 would normally
+        // go to B, but B is locked, so there is no eligible receiver and A
+        // stays at 20 (sum below 100, the user must unlock B to fix it).
+        let mut sliders = pct_sliders(&[50, 50]);
+        sliders[1].locked = true;
+        redistribute_percent(&mut sliders, 0, 20);
+        assert_eq!(pct_values(&sliders), vec![20, 50]);
+    }
+
+    #[test]
     fn redistribute_ignores_non_percent_slider() {
         let mut sliders = pct_sliders(&[50, 50]);
         sliders.push(Slider {
@@ -1931,6 +2444,7 @@ mod tests {
             max: 24,
             step: 1,
             suffix: " h",
+            locked: false,
         });
         let idx = sliders.len() - 1; // the workday slider
         redistribute_percent(&mut sliders, idx, 20);
@@ -2079,5 +2593,175 @@ mod tests {
         assert!(dir.join("totals.simulation_results.txt").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Find the leftmost x at row `y` whose horizontal run of cells matches
+    /// `needle`.
+    fn find_in_row(buf: &ratatui::buffer::Buffer, y: u16, needle: &str) -> Option<u16> {
+        let chars: Vec<char> = needle.chars().collect();
+        let w = buf.area.width;
+        if y >= buf.area.height {
+            return None;
+        }
+        for x in 0..w.saturating_sub(chars.len() as u16) {
+            let mut ok = true;
+            for (i, c) in chars.iter().enumerate() {
+                if buf[((x + i as u16), y)].symbol() != &c.to_string() {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                return Some(x);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn settings_renders_two_columns_side_by_side() {
+        use ratatui::backend::TestBackend;
+        // Two products so the Settings sliders are at indices 2..6.
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+        ];
+        let sliders = build_sliders(&wrap(products.clone()));
+        let mut state = make_state(products, sliders);
+        update_parallel_range(&mut state);
+
+        // 120x40 terminal: sidebar inner ~34 cols, enough for two ~16-col
+        // columns with 1-char padding on all sides.
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // Scope the search to the Settings block: find its title row, then
+        // look for a row below it that has both "Workday" (left col) and
+        // "Monthly" (right col) — the right-column slider label "Monthly
+        // net-profit goal" starts with "Monthly".
+        let settings_y = (0..buf.area.height)
+            .find_map(|y| find_in_row(&buf, y, "Settings").map(|_| y))
+            .expect("Settings title not rendered");
+        let header = (settings_y..buf.area.height)
+            .find_map(|y| {
+                let w = find_in_row(&buf, y, "Workday")?;
+                let m = find_in_row(&buf, y, "Monthly")?;
+                Some((y, w, m))
+            })
+            .expect("Workday/Monthly not rendered side by side in Settings");
+        let (_, workday_x, monthly_x) = header;
+        assert!(
+            monthly_x > workday_x,
+            "Monthly (right col) must be right of Workday (left col): workday_x={} monthly_x={}",
+            workday_x,
+            monthly_x
+        );
+
+        // A vertical separator rule (U+2502) must exist between the two labels,
+        // at an x strictly between them.
+        let y = header.0;
+        let mut found_sep = false;
+        for x in (workday_x + 1)..monthly_x {
+            if buf[(x, y)].symbol() == "\u{2502}" {
+                found_sep = true;
+                break;
+            }
+        }
+        assert!(found_sep, "no vertical separator between the two settings columns");
+    }
+
+    #[test]
+    fn totals_renders_two_columns_side_by_side() {
+        use ratatui::backend::TestBackend;
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+        ];
+        let sliders = build_sliders(&wrap(products.clone()));
+        let mut state = make_state(products, sliders);
+        update_parallel_range(&mut state);
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The Totals block's left column header is "Monthly", right column
+        // header is "Yearly".  Both appear inside the Totals block; find the
+        // Totals title row first to scope the search below it.  "Monthly" also
+        // appears in the Products panel, so search row by row starting at the
+        // Totals title and take the first row that has both labels.
+        let totals_y = (0..buf.area.height)
+            .find_map(|y| find_in_row(&buf, y, "Totals").map(|_| y))
+            .expect("Totals title not rendered");
+        let header_y = (totals_y..buf.area.height)
+            .find_map(|y| {
+                let m = find_in_row(&buf, y, "Monthly")?;
+                let yr = find_in_row(&buf, y, "Yearly")?;
+                Some((y, m, yr))
+            })
+            .expect("Monthly/Yearly headers not rendered side by side in Totals");
+        let (_, monthly_x, yearly_x) = header_y;
+        assert!(
+            yearly_x > monthly_x,
+            "Yearly (right col) must be right of Monthly (left col): monthly_x={} yearly_x={}",
+            monthly_x,
+            yearly_x
+        );
+
+        // A vertical separator rule must exist between them.
+        let y = header_y.0;
+        let mut found_sep = false;
+        for x in (monthly_x + 1)..yearly_x {
+            if buf[(x, y)].symbol() == "\u{2502}" {
+                found_sep = true;
+                break;
+            }
+        }
+        assert!(found_sep, "no vertical separator between the two totals columns");
+    }
+
+    /// Verify the sidebar padding is clamped so all product rows fit: with many
+    /// products on a short terminal, the padding must drop to 0 (no top blank
+    /// line inside the Products border) so every row is visible.
+    #[test]
+    fn sidebar_padding_clamps_to_fit_all_product_rows() {
+        use ratatui::backend::TestBackend;
+        // 10 products × 3 lines = 30 content lines needed.
+        let products: Vec<ProductResult> = (0..10)
+            .map(|i| prod(&format!("P{}", i), 10.0, 5.0, 5.0))
+            .collect();
+        let sliders = build_sliders(&wrap(products.clone()));
+        let mut state = make_state(products, sliders);
+        update_parallel_range(&mut state);
+
+        // 80x40 terminal: sidebar inner ~22 cols (desired_pad=1), but Products
+        // only gets 40-14-13=13 rows; 10 products need 30 lines, so padding
+        // must clamp to 0.
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The Products block top border row: find "Products" title, then check
+        // the row immediately below the top border.  With pad=0 the first
+        // product slider header appears right below the border (row+1); with
+        // pad>=1 there's a blank row (row+1 blank, content at row+2).
+        let products_y = (0..buf.area.height)
+            .find_map(|y| find_in_row(&buf, y, "Products").map(|_| y))
+            .expect("Products title not rendered");
+        // The first product slider label is "% P0".
+        let p0_row = (products_y + 1..buf.area.height)
+            .find_map(|y| find_in_row(&buf, y, "% P0").map(|_| y))
+            .expect("% P0 not rendered");
+        // With padding clamped to 0, the content starts immediately after the
+        // border: p0_row == products_y + 1.
+        assert_eq!(
+            p0_row, products_y + 1,
+            "padding should be 0 (content right below border) when products don't fit otherwise, got p0_row={} products_y={}",
+            p0_row, products_y
+        );
     }
 }

@@ -52,7 +52,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
 
 use crate::lang::{self, Lang};
@@ -519,7 +519,9 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
     }
 
     frame.render_widget(
-        Paragraph::new(lines).scroll((state.product_scroll as u16, 0)),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.product_scroll as u16, 0)),
         text_area,
     );
 
@@ -1073,7 +1075,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
 
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(84), Constraint::Percentage(16)])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(body);
 
     let chart_area = body_chunks[0];

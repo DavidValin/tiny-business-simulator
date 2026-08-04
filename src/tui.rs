@@ -411,8 +411,15 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
 
     let bar_gap: u16 = 1;
     let group_gap: u16 = 2;
-    let bar_width = fit_bar_width(inner.width, bar_gap, group_gap);
+    // 1-char margin on each side so bars never touch the border, then center
+    // the resulting chart block horizontally within the available width.
+    let chart_margin: u16 = 1;
+    let avail_width = inner.width.saturating_sub(chart_margin * 2);
+    let bar_width = fit_bar_width(avail_width, bar_gap, group_gap);
     let group_width = 2 * bar_width + bar_gap;
+    let total_chart_width: u16 =
+        (12u32 * group_width as u32 + 11 * group_gap as u32) as u16;
+    let chart_x = inner.x + chart_margin + avail_width.saturating_sub(total_chart_width) / 2;
 
     // Reserve 2 rows at the bottom for the bar labels (n/$) and month labels.
     let label_rows: u16 = 2;
@@ -432,7 +439,7 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let max = max_with_headroom;
 
     for g in 0..12u16 {
-        let group_x = inner.x + g * (group_width + group_gap);
+        let group_x = chart_x + g * (group_width + group_gap);
         let n_x = group_x;
         let d_x = group_x + bar_width + bar_gap;
         let mt = &months[g as usize];
@@ -1563,9 +1570,13 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
             });
         let ms_inner = ms_block.inner(ms_area);
         frame.render_widget(ms_block, ms_area);
-        if ms_inner.height > 0 {
-            let ms_lines = build_slider_lines(state, 0, 1, ms_inner.width);
-            frame.render_widget(Paragraph::new(ms_lines), ms_inner);
+        if ms_inner.height > 0 && ms_inner.width >= 1 {
+            // 1-char right padding so content doesn't touch the right border.
+            let ms_content_w = ms_inner.width.saturating_sub(1);
+            let ms_lines = build_slider_lines(state, 0, 1, ms_content_w);
+            let ms_content =
+                Rect::new(ms_inner.x, ms_inner.y, ms_content_w, ms_inner.height);
+            frame.render_widget(Paragraph::new(ms_lines), ms_content);
         }
     }
 
@@ -1589,7 +1600,8 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
     let start = products_start + state.scroll;
     let end = (start + visible_entries).min(settings_start);
-    let top_inner_w = top_area.width.saturating_sub(2 + sidebar_pad * 2);
+    let right_pad = sidebar_pad.max(1);
+    let top_inner_w = top_area.width.saturating_sub(2 + sidebar_pad + right_pad);
     let product_lines = build_slider_lines(state, start, end, top_inner_w);
     let top_title: String = match state.tab {
         Tab::Products => state.lang.dict().tui_products_yearly.to_string(),
@@ -1669,6 +1681,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
 
         let pad = sidebar_pad;
+        let right_pad = pad.max(1);
         let left_inner = Rect::new(
             left_area.x + pad,
             left_area.y + pad,
@@ -1678,7 +1691,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         let right_inner = Rect::new(
             right_area.x + pad,
             right_area.y + pad,
-            right_area.width.saturating_sub(pad * 2),
+            right_area.width.saturating_sub(pad + right_pad),
             right_area.height.saturating_sub(pad * 2),
         );
         let mid = (settings_start + 2).min(total_sliders);
@@ -1728,6 +1741,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
 
         let pad = sidebar_pad;
+        let right_pad = pad.max(1);
         let left_inner = Rect::new(
             left_area.x + pad,
             left_area.y + pad,
@@ -1737,7 +1751,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         let right_inner = Rect::new(
             right_area.x + pad,
             right_area.y + pad,
-            right_area.width.saturating_sub(pad * 2),
+            right_area.width.saturating_sub(pad + right_pad),
             right_area.height.saturating_sub(pad * 2),
         );
         let (left_lines, right_lines) = build_totals_columns(state);

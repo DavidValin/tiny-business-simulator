@@ -42,11 +42,11 @@ jobs:
           # Linux glibc
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: tiny-business-simulator-x86_64_linux_gnu
+            artifact: tiny-business-simulator-x86_64_linux
             use_cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            artifact: tiny-business-simulator-aarch64_linux_gnu
+            artifact: tiny-business-simulator-aarch64_linux
             use_cross: true
           # Linux musl (static)
           - target: x86_64-unknown-linux-musl
@@ -59,8 +59,8 @@ jobs:
             use_cross: true
           # macOS
           - target: x86_64-apple-darwin
-            runner: macos-13
-            artifact: tiny-business-simulator-x86_64_macos
+            runner: macos-14
+            artifact: tiny-business-simulator-x86_64_macos-intel
             use_cross: false
           - target: aarch64-apple-darwin
             runner: macos-14

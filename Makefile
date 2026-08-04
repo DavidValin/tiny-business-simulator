@@ -9,11 +9,11 @@
 #   make install-cross    - install `cross` (Docker) for linux cross/musl builds
 #
 #   Release artifacts (mirrors .github/workflows/release.yml, output in dist/):
-#   make linux            - x86_64-unknown-linux-gnu     -> dist/...x86_64_linux_gnu.tar.gz
-#   make linux-arm64      - aarch64-unknown-linux-gnu    -> dist/...aarch64_linux_gnu.tar.gz
+#   make linux            - x86_64-unknown-linux-gnu     -> dist/...x86_64_linux.tar.gz
+#   make linux-arm64      - aarch64-unknown-linux-gnu    -> dist/...aarch64_linux.tar.gz
 #   make musl             - x86_64-unknown-linux-musl    -> dist/...x86_64_linux_musl.tar.gz
 #   make musl-arm64       - aarch64-unknown-linux-musl   -> dist/...aarch64_linux_musl.tar.gz
-#   make macos-intel      - x86_64-apple-darwin          -> dist/...x86_64_macos.tar.gz
+#   make macos-intel      - x86_64-apple-darwin          -> dist/...x86_64_macos-intel.tar.gz
 #   make macos-arm        - aarch64-apple-darwin         -> dist/...aarch64_macos.tar.gz
 #   make windows          - x86_64-pc-windows-msvc       -> dist/...x86_64_windows.zip
 #   make windows-arm64    - aarch64-pc-windows-msvc      -> dist/...aarch64_windows.zip
@@ -80,11 +80,11 @@ endef
 
 linux:
 	cargo build --release --locked --target x86_64-unknown-linux-gnu
-	$(call archive-tar,x86_64-unknown-linux-gnu,tiny-business-simulator-x86_64_linux_gnu.tar.gz)
+	$(call archive-tar,x86_64-unknown-linux-gnu,tiny-business-simulator-x86_64_linux.tar.gz)
 
 linux-arm64:
 	cross build --release --locked --target aarch64-unknown-linux-gnu
-	$(call archive-tar,aarch64-unknown-linux-gnu,tiny-business-simulator-aarch64_linux_gnu.tar.gz)
+	$(call archive-tar,aarch64-unknown-linux-gnu,tiny-business-simulator-aarch64_linux.tar.gz)
 
 musl:
 	cross build --release --locked --target x86_64-unknown-linux-musl
@@ -96,7 +96,7 @@ musl-arm64:
 
 macos-intel:
 	cargo build --release --locked --target x86_64-apple-darwin
-	$(call archive-tar,x86_64-apple-darwin,tiny-business-simulator-x86_64_macos.tar.gz)
+	$(call archive-tar,x86_64-apple-darwin,tiny-business-simulator-x86_64_macos-intel.tar.gz)
 
 macos-arm:
 	cargo build --release --locked --target aarch64-apple-darwin

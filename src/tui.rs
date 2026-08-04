@@ -59,7 +59,7 @@ use ratatui::Terminal;
 use crate::lang::{self, Lang};
 use crate::parser::parse_content;
 use crate::simulator::{
-    collect_txt_files, compute_product_shares, compute_result, parallel_range,
+    collect_txt_files, compute_product_shares, compute_result,
     write_result_file_monthly, write_totals_file_monthly, ProductResult,
 };
 
@@ -78,23 +78,30 @@ fn months(lang: &Lang) -> [&'static str; 12] {
 
 /// Kinds of sliders shown in the sidebar.
 ///
-/// `YearlyPercent(i)` — the product's yearly % (Products tab). The value is
-/// *derived* (the mean of the 12 monthly %) and shown as a slider; editing it
-/// propagates to every month where the product isn't month-locked.
+/// `YearlyPercent(i)` — the product's yearly % (Full Year period). The value
+/// is *derived* (the mean of the 12 monthly %) and shown as a slider; editing
+/// it propagates to every month where the product isn't month-locked.
 ///
 /// `MonthPercent(i)` — the product's % for the currently-selected month
-/// (Graph tab). Editing it only affects that month.
+/// (a Month period). Editing it only affects that month.
 ///
-/// `MonthSelector` — the Jan..Dec `<select>` at the top of the Graph sidebar.
+/// Full-Year global minimum / target sliders:
+///   `MinWorkdayHours`, `MinParallel`, `MinMonthlyNetProfit`,
+///   `TargetYearlyNetProfit`.
+///
+/// Per-month override sliders (a Month period `m`):
+///   `MonthWorkdayHours(m)`, `MonthParallel(m)`, `MonthNetProfit(m)`.
 #[derive(Clone, Copy, PartialEq)]
 enum SliderKind {
     YearlyPercent(usize),
     MonthPercent(usize),
-    MonthSelector,
-    WorkdayHours,
-    Parallel,
-    MonthlyGoal,
-    YearlyGoal,
+    MinWorkdayHours,
+    MinParallel,
+    MinMonthlyNetProfit,
+    TargetYearlyNetProfit,
+    MonthWorkdayHours(usize),
+    MonthParallel(usize),
+    MonthNetProfit(usize),
 }
 
 #[derive(Clone)]
@@ -134,13 +141,9 @@ impl Slider {
     }
 }
 
-/// Human-readable value readout for a slider's track line. For the month
-/// selector the readout is the month name rather than a raw number.
-fn slider_readout(s: &Slider, lang: &Lang) -> String {
-    match s.kind {
-        SliderKind::MonthSelector => format!(" {}", lang.months_abbr()[s.value as usize]),
-        _ => format!(" {}{}", s.value, s.suffix),
-    }
+/// Human-readable value readout for a slider's track line.
+fn slider_readout(s: &Slider, _lang: &Lang) -> String {
+    format!(" {}{}", s.value, s.suffix)
 }
 
 /// Whether a slider is a product-percentage slider (and thus shows the
@@ -163,14 +166,53 @@ fn slider_lock_label<'a>(s: &Slider, lang: &Lang) -> &'a str {
 // TUI state
 // ---------------------------------------------------------------------------
 
-/// Which of the two main-area tabs is active.  `Products` (the default, shown
-/// first) lists the per-product simulation values (the same values written to
-/// each `*.simulation_results.txt` on export) in a scrollable view; `Graph`
-/// shows the 12-month chart.
+/// Which of the two main-area sub-tabs is active.  `Products` (the default,
+/// shown first) lists the per-product simulation values (the same values
+/// written to each `*.simulation_results.txt` on export) in a scrollable
+/// view; `Graph` shows the 12-month chart.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Products,
     Graph,
+}
+
+/// The currently-selected top-level period tab.  `FullYear` (the default when
+/// the program opens) shows the global minimum/target settings and the yearly
+/// percentage sliders; `Month(m)` shows that month's override settings and
+/// that month's percentage sliders, and (on the Graph sub-tab) borders that
+/// month's bars on the always-full-year chart.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Period {
+    FullYear,
+    Month(usize),
+}
+
+impl Period {
+    /// The month index if this is a `Month`, else `None`.
+    fn month(self) -> Option<usize> {
+        match self {
+            Period::FullYear => None,
+            Period::Month(m) => Some(m),
+        }
+    }
+
+    /// Previous / next period for the `[` / `]` keys.  Order:
+    /// Full Year, Jan, Feb, ..., Dec.
+    fn prev(self) -> Period {
+        match self {
+            Period::FullYear => Period::Month(11),
+            Period::Month(0) => Period::FullYear,
+            Period::Month(m) => Period::Month(m - 1),
+        }
+    }
+
+    fn next(self) -> Period {
+        match self {
+            Period::FullYear => Period::Month(0),
+            Period::Month(11) => Period::FullYear,
+            Period::Month(m) => Period::Month(m + 1),
+        }
+    }
 }
 
 /// Which on-screen region currently receives Up/Down scroll/navigation.  `Main`
@@ -195,11 +237,11 @@ struct AppState {
     /// (month checkboxes render checked + greyed, uneditable) and pins its
     /// yearly % (which stays equal to the mean of the frozen months).
     yearly_locked: Vec<bool>,
-    /// Currently-selected month for the Graph tab's `<select>` (0 = Jan).
-    selected_month: usize,
-    /// Flat slider list rebuilt whenever the tab or selected month changes.
+    /// Currently-selected top-level period (Full Year or a month 0..11).
+    period: Period,
+    /// Flat slider list rebuilt whenever the period or sub-tab changes.
     /// Yearly slider values are derived from `monthly_pct` (mean of the 12
-    /// months); monthly slider values are `monthly_pct[p][selected_month]`.
+    /// months); monthly slider values are `monthly_pct[p][month]`.
     sliders: Vec<Slider>,
     selected: usize,
     /// Top visible entry index in the sidebar's scrollable slider list.
@@ -208,7 +250,7 @@ struct AppState {
     folder: PathBuf,
     /// Transient "exported to <path>" / error message shown in the footer.
     status: Option<String>,
-    /// Active main-area tab.
+    /// Active main-area sub-tab (Products / Graph).
     tab: Tab,
     /// Top visible line index of the Products scrollable view.
     product_scroll: usize,
@@ -221,9 +263,57 @@ struct AppState {
     show_help: bool,
     /// Top visible line index of the help overlay's scrollable text.
     help_scroll: usize,
+    /// Full-Year global minimum / target settings.
+    settings: GlobalSettings,
+    /// Per-month override arrays (workday hours, parallel products, monthly
+    /// net profit goal). Clamped to be at least the global minimums.
+    month_overrides: MonthOverrides,
+}
+
+/// Full-Year global minimum / target settings.  Per-month overrides
+/// (below) are clamped to be at least these minimums.  All fields are `i64`
+/// so the struct is `Copy`.
+#[derive(Clone, Copy)]
+struct GlobalSettings {
+    /// "min. workday hours" (default 8).
+    min_workday_hours: i64,
+    /// "min. paralell products" (default 1).
+    min_parallel: i64,
+    /// "min. monthly net profit" (default 500).
+    min_monthly_net_profit: i64,
+    /// "target yearly net profit" (default 500).  Reference target only;
+    /// there is no per-month override for it.
+    target_yearly_net_profit: i64,
+}
+
+/// Default global settings (the values the program opens with).
+const DEFAULT_MIN_WORKDAY_HOURS: i64 = 8;
+const DEFAULT_MIN_PARALLEL: i64 = 1;
+const DEFAULT_MIN_MONTHLY_NET_PROFIT: i64 = 500;
+const DEFAULT_TARGET_YEARLY_NET_PROFIT: i64 = 500;
+
+/// Per-month override arrays (workday hours, parallel products, monthly net
+/// profit goal).  Each entry is clamped to be at least the corresponding
+/// global minimum.  Defaults equal the global minimums.
+#[derive(Clone)]
+struct MonthOverrides {
+    workday: [i64; 12],
+    parallel: [i64; 12],
+    net_profit: [i64; 12],
+}
+
+impl Default for MonthOverrides {
+    fn default() -> Self {
+        MonthOverrides {
+            workday: [DEFAULT_MIN_WORKDAY_HOURS; 12],
+            parallel: [DEFAULT_MIN_PARALLEL; 12],
+            net_profit: [DEFAULT_MIN_MONTHLY_NET_PROFIT; 12],
+        }
+    }
 }
 
 impl AppState {
+    #[allow(dead_code)]
     fn slider_value(&self, kind: SliderKind) -> i64 {
         self.sliders
             .iter()
@@ -245,6 +335,41 @@ impl AppState {
     #[allow(dead_code)]
     fn monthly_pcts(&self, idx: usize) -> [i64; 12] {
         self.monthly_pct[idx]
+    }
+
+    /// Effective workday hours for month `m`: the per-month override clamped
+    /// to be at least `min_workday_hours`.
+    fn workday_hours(&self, m: usize) -> i64 {
+        self.month_overrides.workday[m].max(self.settings.min_workday_hours).max(1)
+    }
+
+    /// Effective parallel products for month `m`: the per-month override
+    /// clamped to be at least `min_parallel`.
+    fn parallel(&self, m: usize) -> i64 {
+        self.month_overrides.parallel[m].max(self.settings.min_parallel).max(1)
+    }
+
+    /// Effective monthly net-profit goal for month `m`: the per-month override
+    /// clamped to be at least `min_monthly_net_profit`.
+    fn monthly_goal(&self, m: usize) -> i64 {
+        self.month_overrides.net_profit[m].max(self.settings.min_monthly_net_profit).max(0)
+    }
+
+    /// Clamp every per-month override array up to the corresponding global
+    /// minimum. Called after a minimum slider changes so the invariant
+    /// `override >= min` is restored.
+    fn clamp_overrides_to_mins(&mut self) {
+        for m in 0..12 {
+            if self.month_overrides.workday[m] < self.settings.min_workday_hours {
+                self.month_overrides.workday[m] = self.settings.min_workday_hours;
+            }
+            if self.month_overrides.parallel[m] < self.settings.min_parallel {
+                self.month_overrides.parallel[m] = self.settings.min_parallel;
+            }
+            if self.month_overrides.net_profit[m] < self.settings.min_monthly_net_profit {
+                self.month_overrides.net_profit[m] = self.settings.min_monthly_net_profit;
+            }
+        }
     }
 
     /// Normalized share (0..=1) for product `idx` in month `m`. If the month's
@@ -271,11 +396,12 @@ impl AppState {
     }
 
     /// Core computation for one month: required (uncapped) sales per product,
-    /// the capacity scale factor, and the resulting capped sales.
+    /// the capacity scale factor, and the resulting capped sales. Uses that
+    /// month's own workday hours, parallel products and net-profit goal.
     fn compute_month(&self, m: usize) -> MonthComputation {
-        let monthly_goal = self.slider_value(SliderKind::MonthlyGoal) as f64;
-        let workday_hours = self.slider_value(SliderKind::WorkdayHours).max(1) as f64;
-        let parallel = self.slider_value(SliderKind::Parallel).max(1) as f64;
+        let monthly_goal = self.monthly_goal(m) as f64;
+        let workday_hours = self.workday_hours(m) as f64;
+        let parallel = self.parallel(m) as f64;
 
         let capacity_minutes = workday_hours * WORKDAYS_PER_MONTH * 60.0 * parallel;
 
@@ -339,10 +465,13 @@ impl AppState {
         }
     }
 
-    /// Convenience: the selected month's totals (used by the chart title etc.).
+    /// Convenience: the selected period's month totals (used by the chart title
+    /// etc.). For `Full Year` this falls back to January as the representative
+    /// monthly load (the totals sidebar uses the annual sum directly).
     #[allow(dead_code)]
     fn month_totals(&self) -> MonthTotals {
-        self.month_totals_for(self.selected_month)
+        let m = self.period.month().unwrap_or(0);
+        self.month_totals_for(m)
     }
 }
 
@@ -406,19 +535,30 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         .fold(1.0f64, f64::max);
     let max_with_headroom = (max_val * 1.25).max(max_val + 1.0);
 
-    let sel = state.selected_month;
-    let mt = &months[sel];
+    let sel = state.period.month();
     let d = state.lang.dict();
     let mnames = state.lang.months_abbr();
     // The stats line (axis max + selected-month + yearly figures) is rendered
     // below the legend, as the first line inside the bordered region, so it is
     // easy to read instead of being crammed into the title next to the legend.
-    let stats = format!(
-        "  {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})   {7}: n={8} \u{00a4}={9:.0} ({10} {11:.0})",
-        d.tui_axis_max, max_with_headroom,
-        mnames[sel], mt.units, mt.amount, d.tui_profit, mt.profit,
-        d.tui_yearly, yearly_units, yearly_amount, d.tui_profit, yearly_profit,
-    );
+    // For a Month period the selected month's figures are shown; for Full Year
+    // only the yearly figures appear.
+    let stats = match sel {
+        Some(m) => {
+            let mt = &months[m];
+            format!(
+                "  {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})   {7}: n={8} \u{00a4}={9:.0} ({10} {11:.0})",
+                d.tui_axis_max, max_with_headroom,
+                mnames[m], mt.units, mt.amount, d.tui_profit, mt.profit,
+                d.tui_yearly, yearly_units, yearly_amount, d.tui_profit, yearly_profit,
+            )
+        }
+        None => format!(
+            "  {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})",
+            d.tui_axis_max, max_with_headroom,
+            d.tui_yearly, yearly_units, yearly_amount, d.tui_profit, yearly_profit,
+        ),
+    };
     let active = state.active_region == Region::Main;
     let border_style = if active {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -454,12 +594,17 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         );
     }
 
-    // Axis-max label at the top-left of the chart area (just below the stats).
+    // Axis-max label: moved onto the stats line, right-aligned with a 2-space
+    // margin before the right border so it never collides with it.
     let chart_top = inner.y + stats_rows;
     let axis_label = format!("\u{2191} {} {:.0}", d.tui_max, max_with_headroom);
+    let axis_x = inner.x
+        + inner
+            .width
+            .saturating_sub(axis_label.chars().count() as u16 + 2);
     buf.set_string(
-        inner.x,
-        chart_top,
+        axis_x,
+        inner.y,
         &axis_label,
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     );
@@ -535,17 +680,34 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             buf.set_string(n_label_x, bar_bottom + 1, "n", label_style);
             buf.set_string(d_label_x, bar_bottom + 1, "$", label_style);
         }
-        // Month label centered under the group; the selected month is highlighted.
+        // Month label centered under the group; the selected month is
+        // highlighted (only when a Month period is active).
         let m = mnames[g as usize];
         let m_w = m.chars().count() as u16;
         let m_x = group_x + group_width.saturating_sub(m_w) / 2;
         if bar_bottom + 2 < inner.y + inner.height {
-            let ms = if g as usize == state.selected_month {
+            let ms = if sel == Some(g as usize) {
                 sel_month_style
             } else {
                 month_style
             };
             buf.set_string(m_x, bar_bottom + 2, m, ms);
+        }
+
+        // When a Month period is active, mark that month's bar group with a
+        // downward arrow at the top, pointing into the bars (skipped for Full
+        // Year, where no month is selected). The arrow sits in the inter-bar
+        // gap at the top row of the bar area so it never overlaps a bar or its
+        // value label.
+        if sel == Some(g as usize) {
+            let arrow_st = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            let arrow_x = group_x + bar_width + bar_gap / 2;
+            let arrow_y = chart_top;
+            if arrow_y >= inner.y && arrow_y < inner.y + inner.height
+                && arrow_x >= inner.x && arrow_x < inner.x + inner.width
+            {
+                buf.set_string(arrow_x, arrow_y, "\u{25bc}", arrow_st);
+            }
         }
     }
 }
@@ -614,9 +776,51 @@ fn draw_bar_column(
     }
 }
 
-/// Render the two main-area tabs (`Graph`, `Product details`) across `area`.
-/// The active tab is shown inverted/bold; the inactive one is dim.
-fn render_tab_bar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+/// Render the top-level period tab bar (`Full Year`, `Jan`..`Dec`) across
+/// `area`. The active period is shown inverted/bold; the inactive ones are
+/// dim. The labels come from `tui_tab_full_year` and the language's month
+/// abbreviations.
+fn render_period_bar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
+    let d = state.lang.dict();
+    let mnames = state.lang.months_abbr();
+    // 13 labels: Full Year, then Jan..Dec.
+    let labels: Vec<&'static str> = std::iter::once(d.tui_tab_full_year)
+        .chain(mnames.iter().copied())
+        .collect();
+    let active_idx = match state.period {
+        Period::FullYear => 0,
+        Period::Month(m) => m + 1,
+    };
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, label) in labels.iter().enumerate() {
+        let active = i == active_idx;
+        let style = if active {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(format!(" {} ", label), style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Render a full-width horizontal separator rule across `area`.
+fn render_separator(frame: &mut ratatui::Frame, area: Rect) {
+    let buf = frame.buffer_mut();
+    let style = Style::default().fg(Color::DarkGray);
+    let mut x = area.x;
+    while x < area.x + area.width {
+        buf.set_string(x, area.y, "\u{2500}", style);
+        x += 1;
+    }
+}
+
+/// Render the sub-tab bar (`Products`, `Graph`) across `area`. The active
+/// sub-tab is shown inverted/bold; the inactive one is dim.
+fn render_subtab_bar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let d = state.lang.dict();
     let tabs = [(Tab::Products, d.tui_tab_products), (Tab::Graph, d.tui_tab_graph)];
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -635,13 +839,21 @@ fn render_tab_bar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Render the scrollable per-product details view, mirroring the lines written
-/// to each product's `*.simulation_results.txt` by `simulator::write_result_file`:
-/// product stats (name, sale price, total cost, net profit/unit, profit margin,
-/// production time), the monthly and annual goal + sales + time breakdown, and
-/// the shared workday / parallel settings.  All products are concatenated and
-/// the view is scrollable with Up/Down while this tab is active.
+/// Render the scrollable per-product details view.  For the Full Year period
+/// this mirrors the lines written to each product's `*.simulation_results.txt`
+/// (stats + 12 monthly rows + annual + workday/parallel) with two donut
+/// graphs per product.  For a Month period it shows each product's stats plus
+/// that single month's row only.  All products are concatenated and the view
+/// is scrollable with Up/Down while this sub-tab is active.
 fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    match state.period {
+        Period::Month(m) => render_product_details_month(frame, area, state, m),
+        Period::FullYear => render_product_details_full_year(frame, area, state),
+    }
+}
+
+/// Full-Year per-product details view (stats + 12 months + annual + donuts).
+fn render_product_details_full_year(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
     let active = state.active_region == Region::Main;
     let border_style = if active {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -650,8 +862,6 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(state.lang.dict().tui_tab_products)
-        .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -696,7 +906,7 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
 
     let buf = frame.buffer_mut();
     let n = state.products.len();
-    let yearly_goal = state.slider_value(SliderKind::YearlyGoal) as f64;
+    let yearly_goal = state.settings.target_yearly_net_profit as f64;
     // Per-month, per-product capped sales (what the chart and donuts show).
     let capped_per_month: Vec<Vec<i64>> =
         (0..12).map(|m| state.capped_product_sales(m)).collect();
@@ -778,6 +988,213 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
             );
         }
     }
+}
+
+/// Month-period per-product details view: each product shows its stats block
+/// plus a single row for the selected month (and that month's workday /
+/// parallel / net-profit override). No donuts, no annual row. Products are
+/// separated by a full-width rule.
+fn render_product_details_month(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &mut AppState,
+    m: usize,
+) {
+    let active = state.active_region == Region::Main;
+    let border_style = if active {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let pad = PROD_PAD as u16;
+    let text_area = Rect::new(
+        inner.x + pad,
+        inner.y,
+        inner.width.saturating_sub(pad * 2).max(1),
+        inner.height,
+    );
+
+    let lines = build_product_details_lines_month(state, m);
+    let total = lines.len();
+    let visible = inner.height as usize;
+    if total <= visible {
+        state.product_scroll = 0;
+    } else if state.product_scroll > total - visible {
+        state.product_scroll = total - visible;
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.product_scroll as u16, 0)),
+        text_area,
+    );
+
+    // Separator rules between products: one blank line per product boundary
+    // (the last product has no trailing separator) is overdrawn with a rule.
+    let buf = frame.buffer_mut();
+    let n = state.products.len();
+    let rule_style = Style::default().fg(Color::DarkGray);
+    // Month-view layout per product: top pad (1) + content (9) + bottom pad (1)
+    // = 11 lines, plus 1 separator blank = 12 lines per product.
+    let lines_per_product_month = MONTH_PRODUCT_CONTENT_LINES + 2 * PROD_PAD + 1;
+    for k in 0..n {
+        if k + 1 < n {
+            let sep_line = k * lines_per_product_month + (MONTH_PRODUCT_CONTENT_LINES + 2 * PROD_PAD);
+            let sep_y = inner.y as i64 + sep_line as i64 - state.product_scroll as i64;
+            if sep_y >= inner.y as i64 && sep_y < (inner.y + inner.height) as i64 {
+                let y = sep_y as u16;
+                let mut x = inner.x;
+                while x < inner.x + inner.width {
+                    buf.set_string(x, y, "\u{2500}", rule_style);
+                    x += 1;
+                }
+            }
+        }
+    }
+
+    // Scroll indicators.
+    let can_up = state.product_scroll > 0;
+    let can_down = total > visible && state.product_scroll + visible < total;
+    let arrow_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    if inner.width >= 1 && inner.height >= 1 {
+        let right_col = inner.x + inner.width.saturating_sub(1);
+        if can_up {
+            frame.render_widget(
+                Paragraph::new("\u{2191}").style(arrow_style),
+                Rect::new(right_col, inner.y, 1, 1),
+            );
+        }
+        if can_down {
+            frame.render_widget(
+                Paragraph::new("\u{2193}").style(arrow_style),
+                Rect::new(right_col, inner.y + inner.height.saturating_sub(1), 1, 1),
+            );
+        }
+    }
+}
+
+/// Number of text lines describing one product in the month details view:
+/// 6 stats + 1 blank + 1 month row + 1 blank + 1 workday + 1 parallel +
+/// 1 net-profit = 11. Excludes padding and the separator blank.
+const MONTH_PRODUCT_CONTENT_LINES: usize = 11;
+
+/// Build the per-product lines for the Month-period Products view: stats block
+/// + the selected month's row + that month's workday / parallel / net-profit
+/// override settings. Products are separated by a blank line (overdrawn as a
+/// rule by the renderer).
+fn build_product_details_lines_month(state: &AppState, m: usize) -> Vec<Line<'static>> {
+    let d = state.lang.dict();
+    let workday_hours = state.workday_hours(m);
+    let parallel = state.parallel(m);
+    let net_profit_goal = state.monthly_goal(m);
+    let per_month = month_shares(state, m);
+
+    let all_templates = [
+        d.result_product,
+        d.result_sale_price,
+        d.result_total_cost,
+        d.result_net_profit_unit,
+        d.result_profit_margin,
+        d.result_prod_time,
+        d.result_month_row,
+        d.result_workday,
+        d.result_parallel,
+    ];
+    let label_w = all_templates
+        .iter()
+        .map(|t| lang::str_width(lang::prefix_before_value(t)))
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let goal_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let setting_style = Style::default().fg(Color::Green);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, (_, r)) in state.products.iter().enumerate() {
+        let cur = r.currency.to_string();
+
+        // Top padding.
+        lines.push(Line::from(""));
+
+        // Product stats block.
+        let stats: Vec<(&'static str, Vec<String>)> = vec![
+            (d.result_product, vec![r.name.clone()]),
+            (d.result_sale_price, vec![format!("{:.2}", r.price), cur.clone()]),
+            (d.result_total_cost, vec![format!("{:.2}", r.total_cost), cur.clone()]),
+            (d.result_net_profit_unit, vec![format!("{:.2}", r.net_profit), cur.clone()]),
+            (d.result_profit_margin, vec![format!("{:.2}", r.profit_percent)]),
+            (d.result_prod_time, vec![format!("{:.2}", r.duration_minutes)]),
+        ];
+        for (k, (t, row)) in stats.iter().enumerate() {
+            let refs: Vec<&str> = row.iter().map(String::as_str).collect();
+            let text = lang::fmt_aligned(t, &refs, label_w);
+            let style = if k == 0 { header_style } else { Style::default() };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+
+        lines.push(Line::from(""));
+
+        // The selected month's row.
+        let s = &per_month[i];
+        let hours = s.monthly_minutes / 60.0;
+        let prefix = format!("  📆 {}:", crate::simulator::months_abbr(&state.lang)[m]);
+        let text = lang::fmt_prefixed(
+            d.result_month_row,
+            &prefix,
+            &[
+                &format!("{:.2}", s.monthly_goal),
+                &cur,
+                &s.monthly_sales.to_string(),
+                &format!("{:.2}", s.monthly_minutes),
+                &format!("{:.2}", hours),
+            ],
+            label_w,
+        );
+        lines.push(Line::from(Span::styled(text, goal_style)));
+
+        lines.push(Line::from(""));
+
+        // The month's override settings.
+        lines.push(Line::from(Span::styled(
+            lang::fmt_aligned(d.result_workday, &[&workday_hours.to_string()], label_w),
+            setting_style,
+        )));
+        lines.push(Line::from(Span::styled(
+            lang::fmt_aligned(d.result_parallel, &[&parallel.to_string()], label_w),
+            setting_style,
+        )));
+        lines.push(Line::from(Span::styled(
+            lang::fmt_aligned(
+                d.result_net_profit_unit,
+                &[&format!("{:.2}", net_profit_goal as f64), &cur],
+                label_w,
+            ),
+            setting_style,
+        )));
+
+        // Bottom padding.
+        lines.push(Line::from(""));
+
+        // Separator blank (overdrawn as a rule by the renderer, except after
+        // the last product).
+        if i + 1 < state.products.len() {
+            lines.push(Line::from(""));
+        }
+    }
+
+    lines
 }
 
 /// Width (cells) and height (rows) of one donut graph.  The ring is drawn with
@@ -948,9 +1365,14 @@ fn clip_set_str(
 /// like `write_result_file_monthly`) so the value columns line up.
 fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
     let d = state.lang.dict();
-    let workday_hours = state.slider_value(SliderKind::WorkdayHours);
-    let parallel = state.slider_value(SliderKind::Parallel).max(1);
-    // Per-month, per-product shares.
+    // The Full Year view shows the global minimum workday / parallel as the
+    // reference settings (each month's own override is reflected in its
+    // monthly minutes row). The annual time line uses these same reference
+    // values for its workdays calculation.
+    let workday_hours = state.settings.min_workday_hours;
+    let parallel = state.settings.min_parallel.max(1);
+    // Per-month, per-product shares (each month uses its own net-profit goal
+    // override via month_shares).
     let per_month: Vec<Vec<crate::simulator::ProductShare>> =
         (0..12).map(|m| month_shares(state, m)).collect();
 
@@ -977,6 +1399,9 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
     let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let goal_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     let month_style = Style::default();
+    let setting_style = Style::default().fg(Color::Green);
+
+    let selected_month = state.period.month();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, (_, r)) in state.products.iter().enumerate() {
@@ -1026,7 +1451,7 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
                 ],
                 label_w,
             );
-            let style = if m == state.selected_month { goal_style } else { month_style };
+            let style = if selected_month == Some(m) { goal_style } else { month_style };
             lines.push(Line::from(Span::styled(text, style)));
         }
 
@@ -1051,16 +1476,14 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
 
         lines.push(Line::from(""));
 
-        // Shared workday / parallel settings.
-        lines.push(Line::from(lang::fmt_aligned(
-            d.result_workday,
-            &[&workday_hours.to_string()],
-            label_w,
+        // Reference workday / parallel settings (the Full Year minimums).
+        lines.push(Line::from(Span::styled(
+            lang::fmt_aligned(d.result_workday, &[&workday_hours.to_string()], label_w),
+            setting_style,
         )));
-        lines.push(Line::from(lang::fmt_aligned(
-            d.result_parallel,
-            &[&parallel.to_string()],
-            label_w,
+        lines.push(Line::from(Span::styled(
+            lang::fmt_aligned(d.result_parallel, &[&parallel.to_string()], label_w),
+            setting_style,
         )));
 
         // Bottom padding (1 blank line).
@@ -1431,75 +1854,80 @@ fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'stat
     };
     let lw = 11; // label column width
 
-    // --- Left column: Monthly + Settings ---
-    let mut left: Vec<Line<'static>> = Vec::new();
-    left.push(Line::from(Span::styled(d.tui_label_monthly, sub)));
-    left.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_sales, lw), val),
-        Span::styled(format!("{}", t.monthly.sales), val),
-    ]));
-    left.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_min, lw), val),
-        Span::styled(format!("{:.0}", t.monthly.minutes), val),
-    ]));
-    left.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_hours, lw), val),
-        Span::styled(format!("{:.1}", t.monthly.hours), val),
-    ]));
-    left.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_workdays, lw), val),
-        Span::styled(format!("{:.2}", t.monthly.workdays), val),
-    ]));
-    left.push(Line::from(""));
-    left.push(Line::from(Span::styled(d.tui_label_settings, sub)));
-    left.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_workday, lw), val),
-        Span::styled(format!("{} {}", t.workday_hours, d.tui_suffix_hours), val),
-    ]));
-    left.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_parallel, lw), val),
-        Span::styled(format!("{}", t.parallel), val),
-    ]));
+    // A periodic block (Monthly or Yearly): header + sales/min/hours/workdays.
+    let period_block = |header: &'static str, p: &PeriodTotals| -> Vec<Line<'static>> {
+        vec![
+            Line::from(Span::styled(header, sub)),
+            Line::from(vec![
+                Span::styled(lbl(d.tui_label_sales, lw), val),
+                Span::styled(format!("{}", p.sales), val),
+            ]),
+            Line::from(vec![
+                Span::styled(lbl(d.tui_label_min, lw), val),
+                Span::styled(format!("{:.0}", p.minutes), val),
+            ]),
+            Line::from(vec![
+                Span::styled(lbl(d.tui_label_hours, lw), val),
+                Span::styled(format!("{:.1}", p.hours), val),
+            ]),
+            Line::from(vec![
+                Span::styled(lbl(d.tui_label_workdays, lw), val),
+                Span::styled(format!("{:.2}", p.workdays), val),
+            ]),
+        ]
+    };
 
-    // --- Right column: Yearly + Yearly ref ---
-    let mut right: Vec<Line<'static>> = Vec::new();
-    right.push(Line::from(Span::styled(d.tui_label_yearly, sub)));
-    right.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_sales, lw), val),
-        Span::styled(format!("{}", t.annual.sales), val),
-    ]));
-    right.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_min, lw), val),
-        Span::styled(format!("{:.0}", t.annual.minutes), val),
-    ]));
-    right.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_hours, lw), val),
-        Span::styled(format!("{:.1}", t.annual.hours), val),
-    ]));
-    right.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_workdays, lw), val),
-        Span::styled(format!("{:.2}", t.annual.workdays), val),
-    ]));
-    right.push(Line::from(""));
-    // Yearly reference: 12 x monthly goal vs the yearly goal slider.
-    let monthly = state.slider_value(SliderKind::MonthlyGoal);
-    let yearly_target = state.slider_value(SliderKind::YearlyGoal);
-    let year_sum = monthly * 12;
+    // Yearly reference: sum of the 12 monthly net-profit goals vs the target
+    // yearly net profit.
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m)).sum();
+    let yearly_target = state.settings.target_yearly_net_profit;
     let (mark, mark_style) = if year_sum >= yearly_target {
         ("\u{2714}", Style::default().fg(Color::Green))
     } else {
         ("\u{2716}", Style::default().fg(Color::Red))
     };
-    right.push(Line::from(Span::styled(d.tui_label_yearly_ref, sub)));
-    right.push(Line::from(vec![
-        Span::styled(lbl(d.tui_label_12x_mo, lw), val),
-        Span::styled(format!("{}", year_sum), val),
-    ]));
-    right.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(mark.to_string(), mark_style),
-        Span::styled(format!(" {}  {}", d.tui_label_goal, yearly_target), val),
-    ]));
+    let ref_block: Vec<Line<'static>> = {
+        let mut v = vec![Line::from(Span::styled(d.tui_label_yearly_ref, sub))];
+        v.push(Line::from(vec![
+            Span::styled(lbl(d.tui_label_12x_mo, lw), val),
+            Span::styled(format!("{}", year_sum), val),
+        ]));
+        v.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(mark.to_string(), mark_style),
+            Span::styled(format!(" {}  {}", d.tui_label_goal, yearly_target), val),
+        ]));
+        v
+    };
+
+    // --- Left column: period totals ---
+    //   Month period  -> Monthly
+    //   Full Year     -> Yearly
+    let mut left: Vec<Line<'static>> = match state.period {
+        Period::Month(_) => period_block(d.tui_label_monthly, &t.monthly),
+        Period::FullYear => period_block(d.tui_label_yearly, &t.annual),
+    };
+
+    // --- Right column: ---
+    //   Month period  -> Yearly + Yearly ref
+    //   Full Year     -> Yearly ref only (left already shows yearly)
+    let mut right: Vec<Line<'static>> = Vec::new();
+    if state.period == Period::FullYear {
+        right.extend(ref_block);
+    } else {
+        right.extend(period_block(d.tui_label_yearly, &t.annual));
+        right.push(Line::from(""));
+        right.extend(ref_block);
+    }
+
+    // Pad the shorter column so both columns are the same height (the
+    // surrounding bordered region sizes to the taller one).
+    while left.len() < right.len() {
+        left.push(Line::from(""));
+    }
+    while right.len() < left.len() {
+        right.push(Line::from(""));
+    }
 
     (left, right)
 }
@@ -1524,38 +1952,42 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         .split(body);
 
     let chart_area = body_chunks[0];
-    // Split the main area into a one-row tab bar and the content below it.
+    // Split the main area into the period tab bar (1 row), a separator rule
+    // (1 row), the Products/Graph sub-tab bar (1 row), and the content below.
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(chart_area);
-    render_tab_bar(frame, main_chunks[0], state);
-    let content_area = main_chunks[1];
+    render_period_bar(frame, main_chunks[0], state);
+    render_separator(frame, main_chunks[1]);
+    render_subtab_bar(frame, main_chunks[2], state);
+    let content_area = main_chunks[3];
     match state.tab {
         Tab::Products => render_product_details(frame, content_area, state),
         Tab::Graph => render_chart(frame, content_area, state),
     }
 
     // Sidebar layout:
-    //   Graph tab:    [Month selector (fixed, bordered)] [Products (scroll)]
-    //                 [Settings] [Totals]
-    //   Products tab: [Products (scroll)] [Settings] [Totals]
+    //   [Products (scroll)] [Settings] [Totals]
+    // The settings shown depend on the period (Full Year = the 4 global
+    // min/target sliders; a Month = that month's 3 override sliders).
     let sidebar_area = body_chunks[1];
     let total_sliders = state.sliders.len();
     let n_products = state.products.len();
-    let has_month_selector = state.tab == Tab::Graph;
-    // On Graph tab slider 0 is MonthSelector; product sliders follow.
-    let products_start = if has_month_selector { 1 } else { 0 };
+    let products_start = 0usize;
     let settings_start = products_start + n_products;
 
     // Desired dynamic inner padding for every sidebar region.
     let sidebar_inner_w = sidebar_area.width.saturating_sub(2) as usize;
     let desired_pad = ((sidebar_inner_w / 12) as u16).min(4);
 
-    let totals_region_h: u16 = 13;
+    let totals_region_h: u16 = 11;
     let settings_min_h: u16 = 7;
-    // Month selector: 1 slider × 3 lines + 2 border = 5 rows.
-    let month_selector_region_h: u16 = if has_month_selector { 5 } else { 0 };
 
     // Products: each entry is 3 lines (header + track + blank).
     let products_needed = (n_products * 3) as u16;
@@ -1570,7 +2002,8 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     let settings_right_lines = build_slider_lines(state, mid, total_sliders, settings_col_w as u16);
     let settings_needed = settings_left_lines.len().max(settings_right_lines.len()) as u16;
 
-    // Totals: both columns have the same fixed structure (9 lines each).
+    // Totals: both columns have the same height (build_totals_columns pads
+    // the shorter one).
     let (totals_left, totals_right) = build_totals_columns(state);
     let totals_needed = totals_left.len().max(totals_right.len()) as u16;
 
@@ -1581,7 +2014,7 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         let s_h = (2 + settings_needed + p * 2).max(settings_min_h);
         let products_available = sidebar_area
             .height
-            .saturating_sub(s_h + totals_region_h + month_selector_region_h);
+            .saturating_sub(s_h + totals_region_h);
         let products_max_pad = products_available
             .saturating_sub(2 + products_needed) / 2;
         let totals_max_pad = totals_region_h
@@ -1594,54 +2027,17 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     // Build the vertical constraints for the sidebar regions.
-    let sidebar_chunks = if has_month_selector {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(month_selector_region_h),
-                Constraint::Min(6),
-                Constraint::Length(settings_region_h),
-                Constraint::Length(totals_region_h),
-            ])
-            .split(sidebar_area)
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),
-                Constraint::Length(settings_region_h),
-                Constraint::Length(totals_region_h),
-            ])
-            .split(sidebar_area)
-    };
+    let sidebar_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),
+            Constraint::Length(settings_region_h),
+            Constraint::Length(totals_region_h),
+        ])
+        .split(sidebar_area);
 
     let sidebar_active = state.active_region == Region::Sidebar;
     let mut region_idx = 0usize;
-
-    // --- Month selector region (Graph tab only) ---
-    if has_month_selector {
-        let ms_area = sidebar_chunks[region_idx];
-        region_idx += 1;
-        let ms_block = Block::default()
-            .borders(Borders::ALL)
-            .title(state.lang.dict().tui_sidebar_month)
-            .title_style(Style::default().add_modifier(Modifier::BOLD))
-            .border_style(if sidebar_active {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            });
-        let ms_inner = ms_block.inner(ms_area);
-        frame.render_widget(ms_block, ms_area);
-        if ms_inner.height > 0 && ms_inner.width >= 1 {
-            // 1-char right padding so content doesn't touch the right border.
-            let ms_content_w = ms_inner.width.saturating_sub(1);
-            let ms_lines = build_slider_lines(state, 0, 1, ms_content_w);
-            let ms_content =
-                Rect::new(ms_inner.x, ms_inner.y, ms_content_w, ms_inner.height);
-            frame.render_widget(Paragraph::new(ms_lines), ms_content);
-        }
-    }
 
     // --- Products region (scrollable) ---
     let top_area = sidebar_chunks[region_idx];
@@ -1666,9 +2062,12 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     let right_pad = sidebar_pad.max(1);
     let top_inner_w = top_area.width.saturating_sub(2 + sidebar_pad + right_pad);
     let product_lines = build_slider_lines(state, start, end, top_inner_w);
-    let top_title: String = match state.tab {
-        Tab::Products => state.lang.dict().tui_products_yearly.to_string(),
-        Tab::Graph => lang::fmt(state.lang.dict().tui_month_pct_sales, &[state.lang.months_abbr()[state.selected_month]]),
+    let top_title: String = match state.period {
+        Period::FullYear => state.lang.dict().tui_products_yearly.to_string(),
+        Period::Month(m) => lang::fmt(
+            state.lang.dict().tui_month_pct_sales,
+            &[state.lang.months_abbr()[m]],
+        ),
     };
     let products_block = Block::default()
         .borders(Borders::ALL)
@@ -1709,9 +2108,16 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     // --- Settings region ---
+    let settings_title: String = match state.period {
+        Period::FullYear => state.lang.dict().tui_sidebar_settings.to_string(),
+        Period::Month(m) => lang::fmt(
+            state.lang.dict().tui_sidebar_settings_month,
+            &[state.lang.months_abbr()[m]],
+        ),
+    };
     let settings_block = Block::default()
         .borders(Borders::ALL)
-        .title(state.lang.dict().tui_sidebar_settings)
+        .title(settings_title)
         .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(if sidebar_active {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -1829,13 +2235,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     }
 
     let d = state.lang.dict();
-    let region_name = match state.active_region {
-        Region::Main => d.tui_region_main,
-        Region::Sidebar => d.tui_region_sidebar,
-    };
     let footer_text = match &state.status {
-        Some(msg) => lang::fmt(d.tui_footer_status, &[msg, region_name]),
-        None => lang::fmt(d.tui_footer, &[region_name]),
+        Some(msg) => lang::fmt(d.tui_footer_status, &[msg]),
+        None => d.tui_footer.to_string(),
     };
     frame.render_widget(
         Paragraph::new(footer_text)
@@ -2066,8 +2468,7 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
         };
         return false;
     }
-    // Shift+Tab (BackTab): switch the main-area tab (Products <-> Graph) and
-    // rebuild the sidebar slider list for the new tab.
+    // Shift+Tab (BackTab): switch the main-area sub-tab (Products <-> Graph).
     if key.code == KeyCode::BackTab {
         state.tab = match state.tab {
             Tab::Products => Tab::Graph,
@@ -2076,6 +2477,24 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
         state.selected = 0;
         state.scroll = 0;
         state.rebuild_sliders();
+        return false;
+    }
+    // `[` / `]`: move the top-level period selection left / right
+    // (Full Year, Jan, ..., Dec). The sidebar is rebuilt for the new period.
+    if key.code == KeyCode::Char('[') {
+        state.period = state.period.prev();
+        state.selected = 0;
+        state.scroll = 0;
+        state.rebuild_sliders();
+        update_parallel_range(state);
+        return false;
+    }
+    if key.code == KeyCode::Char(']') {
+        state.period = state.period.next();
+        state.selected = 0;
+        state.scroll = 0;
+        state.rebuild_sliders();
+        update_parallel_range(state);
         return false;
     }
     // Up/Down behaviour depends on the active region:
@@ -2114,9 +2533,10 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
                     }
                     SliderKind::MonthPercent(p) => {
                         if !state.yearly_locked[p] {
-                            let m = state.selected_month;
-                            state.month_locked[p][m] = !state.month_locked[p][m];
-                            state.rebuild_sliders();
+                            if let Some(m) = state.period.month() {
+                                state.month_locked[p][m] = !state.month_locked[p][m];
+                                state.rebuild_sliders();
+                            }
                         }
                     }
                     _ => {}
@@ -2144,32 +2564,32 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
     false
 }
 
-/// Apply a ±`dir` step to the focused slider. Handles the month selector
-/// (changes `selected_month` and rebuilds the Graph sidebar), yearly % sliders
+/// Apply a ±`dir` step to the focused slider. Handles yearly % sliders
 /// (propagates to all months), monthly % sliders (redistributes within the
-/// selected month), and plain settings sliders (simple inc/dec).
+/// selected month), and the settings sliders (global min/target and per-month
+/// overrides). After a settings change the slider values are synced back to
+/// the state and overrides are clamped to the minimums.
 fn adjust_slider(state: &mut AppState, dir: i64) {
     let Some(s) = state.sliders.get(state.selected).cloned() else {
         return;
     };
     match s.kind {
-        SliderKind::MonthSelector => {
-            let v = (s.value + dir).clamp(0, 11);
-            state.selected_month = v as usize;
-            state.rebuild_sliders();
-        }
         SliderKind::YearlyPercent(p) => {
             let target = s.value + dir * s.step;
             edit_yearly(state, p, target);
             state.rebuild_sliders();
         }
         SliderKind::MonthPercent(p) => {
-            let m = state.selected_month;
-            let target = state.monthly_pct[p][m] + dir * s.step;
-            redistribute_month(state, m, p, target);
-            state.rebuild_sliders();
+            if let Some(m) = state.period.month() {
+                let target = state.monthly_pct[p][m] + dir * s.step;
+                redistribute_month(state, m, p, target);
+                state.rebuild_sliders();
+            }
         }
         _ => {
+            // A settings slider: inc/dec the slider (clamped to its min/max),
+            // then sync the new value back into the state and clamp overrides
+            // to the minimums.
             if let Some(s) = state.sliders.get_mut(state.selected) {
                 if dir < 0 {
                     s.dec();
@@ -2177,8 +2597,31 @@ fn adjust_slider(state: &mut AppState, dir: i64) {
                     s.inc();
                 }
             }
+            sync_settings_from_sliders(state);
+            state.rebuild_sliders();
         }
     }
+}
+
+/// Copy the settings slider values back into the state (`settings` /
+/// `month_overrides`) and clamp every per-month override up to its global
+/// minimum. Called after a settings slider is adjusted.
+fn sync_settings_from_sliders(state: &mut AppState) {
+    for s in &state.sliders {
+        match s.kind {
+            SliderKind::MinWorkdayHours => state.settings.min_workday_hours = s.value,
+            SliderKind::MinParallel => state.settings.min_parallel = s.value,
+            SliderKind::MinMonthlyNetProfit => state.settings.min_monthly_net_profit = s.value,
+            SliderKind::TargetYearlyNetProfit => {
+                state.settings.target_yearly_net_profit = s.value
+            }
+            SliderKind::MonthWorkdayHours(m) => state.month_overrides.workday[m] = s.value,
+            SliderKind::MonthParallel(m) => state.month_overrides.parallel[m] = s.value,
+            SliderKind::MonthNetProfit(m) => state.month_overrides.net_profit[m] = s.value,
+            _ => {}
+        }
+    }
+    state.clamp_overrides_to_mins();
 }
 
 /// Load and compute every product definition in `folder`.  Products with
@@ -2203,12 +2646,13 @@ fn load_products(folder: &Path, lang: &Lang) -> Vec<(PathBuf, ProductResult)> {
 }
 
 /// Per-product split of the monthly goal for a single month `m`, using that
-/// month's percentage distribution. Only the `monthly_*` fields of the
-/// returned [`ProductShare`] are meaningful (annual fields are zeroed). The
-/// sales counts are the *required* (uncapped) figures — capacity capping is
-/// applied separately in [`AppState::month_totals_for`] for the chart.
+/// month's percentage distribution and that month's net-profit goal override.
+/// Only the `monthly_*` fields of the returned [`ProductShare`] are meaningful
+/// (annual fields are zeroed). The sales counts are the *required* (uncapped)
+/// figures — capacity capping is applied separately in
+/// [`AppState::month_totals_for`] for the chart.
 fn month_shares(state: &AppState, m: usize) -> Vec<crate::simulator::ProductShare> {
-    let monthly_goal = state.slider_value(SliderKind::MonthlyGoal) as f64;
+    let monthly_goal = state.monthly_goal(m) as f64;
     let raw_pcts: Vec<i64> = (0..state.products.len())
         .map(|i| state.monthly_pct[i][m].max(0))
         .collect();
@@ -2225,54 +2669,58 @@ struct PeriodTotals {
     workdays: f64,
 }
 
-/// All totals shown in the sidebar's bottom region (and written to the totals
-/// file on export). `monthly` reflects the currently-selected month; `annual`
-/// is the sum of all 12 months. Both use achievable (capacity-capped) figures
-/// so they agree with the chart.
+/// All totals shown in the sidebar's bottom region. `monthly` reflects the
+/// currently-selected month (when a Month period is active); `annual` is the
+/// sum of all 12 months. Both use achievable (capacity-capped) figures so
+/// they agree with the chart. Workdays are computed per-month (each month
+/// using its own workday hours / parallel override) and summed for the annual
+/// row.
 struct Totals {
     monthly: PeriodTotals,
     annual: PeriodTotals,
-    workday_hours: i64,
-    parallel: i64,
 }
 
 fn compute_totals(state: &AppState) -> Totals {
-    let workday_hours = state.slider_value(SliderKind::WorkdayHours);
-    let parallel = state.slider_value(SliderKind::Parallel).max(1);
-    let wh = workday_hours as f64;
-    let pp = parallel.max(1) as f64;
-
-    // Selected month's achievable (capped) totals — same computation the
-    // chart uses, so the sidebar and chart always agree.
-    let sel = state.selected_month;
-    let mt = state.month_totals_for(sel);
-    let m_hours = mt.achieved_minutes / 60.0;
-
-    // Annual = sum of all 12 months' achievable (capped) totals.
+    // Annual = sum of all 12 months' achievable (capped) totals. Workdays are
+    // summed per-month so each month's own workday hours / parallel override
+    // is respected.
     let mut a_sales = 0i64;
     let mut a_min = 0.0f64;
+    let mut a_workdays = 0.0f64;
     for m in 0..12 {
         let mt_m = state.month_totals_for(m);
         a_sales += mt_m.units;
         a_min += mt_m.achieved_minutes;
+        let wh = state.workday_hours(m) as f64;
+        let pp = state.parallel(m) as f64;
+        let m_hours = mt_m.achieved_minutes / 60.0;
+        a_workdays += m_hours / (wh * pp);
     }
     let a_hours = a_min / 60.0;
+
+    // Selected month's achievable (capped) totals — same computation the
+    // chart uses, so the sidebar and chart always agree. For Full Year the
+    // monthly column is unused by the display (it falls back to yearly), so
+    // January is used as a harmless representative.
+    let sel = state.period.month().unwrap_or(0);
+    let mt = state.month_totals_for(sel);
+    let m_hours = mt.achieved_minutes / 60.0;
+    let wh_m = state.workday_hours(sel) as f64;
+    let pp_m = state.parallel(sel) as f64;
 
     Totals {
         monthly: PeriodTotals {
             sales: mt.units,
             minutes: mt.achieved_minutes,
             hours: m_hours,
-            workdays: m_hours / (wh * pp),
+            workdays: m_hours / (wh_m * pp_m),
         },
         annual: PeriodTotals {
             sales: a_sales,
             minutes: a_min,
             hours: a_hours,
-            workdays: a_hours / (wh * pp),
+            workdays: a_workdays,
         },
-        workday_hours,
-        parallel,
     }
 }
 
@@ -2286,30 +2734,32 @@ fn compute_totals(state: &AppState) -> Totals {
 /// The slider value is clamped into the new range, and its label is refreshed
 /// to show the caps.
 fn update_parallel_range(state: &mut AppState) {
-    let workday_hours = state.slider_value(SliderKind::WorkdayHours);
-    // Use the selected month as the representative monthly load, and the sum
-    // of all 12 months as the annual load.
-    let mshares = month_shares(state, state.selected_month);
-    let total_monthly_minutes: f64 = mshares.iter().map(|s| s.monthly_minutes).sum();
-    let mut total_annual_minutes = 0.0f64;
-    for m in 0..12 {
-        for s in month_shares(state, m) {
-            total_annual_minutes += s.monthly_minutes;
-        }
-    }
-    let (p_min, p_max) = parallel_range(total_monthly_minutes, total_annual_minutes, workday_hours);
-
+    // Only the per-month parallel override slider (shown when a Month period
+    // is active) has a computed range. Its min is the global `min_parallel`
+    // floor; its max is the throughput that brings that month down to 1
+    // workday (using that month's own workday hours). The state field is
+    // clamped into range too so the displayed value and the simulation agree.
+    let Some(m) = state.period.month() else {
+        return;
+    };
+    let monthly_minutes: f64 = month_shares(state, m).iter().map(|s| s.monthly_minutes).sum();
+    let wh = state.workday_hours(m).max(1) as f64;
+    let min_par = state.settings.min_parallel.max(1);
+    let monthly_hours = monthly_minutes / 60.0;
+    let max_par = (monthly_hours / wh).floor() as i64;
+    let max_par = max_par.max(min_par);
+    let lo = state.month_overrides.parallel[m].max(min_par);
+    let clamped = lo.min(max_par).max(min_par);
+    state.month_overrides.parallel[m] = clamped;
     for s in state.sliders.iter_mut() {
-        if let SliderKind::Parallel = s.kind {
-            s.min = p_min;
-            s.max = p_max;
-            if s.value < p_min {
-                s.value = p_min;
-            }
-            if s.value > p_max {
-                s.value = p_max;
-            }
-            s.label = lang::fmt(state.lang.dict().tui_parallel_label, &[&p_min.to_string(), &p_max.to_string()]);
+        if let SliderKind::MonthParallel(_) = s.kind {
+            s.min = min_par;
+            s.max = max_par;
+            s.value = clamped;
+            s.label = lang::fmt(
+                state.lang.dict().tui_parallel_label,
+                &[&min_par.to_string(), &max_par.to_string()],
+            );
         }
     }
 }
@@ -2317,13 +2767,15 @@ fn update_parallel_range(state: &mut AppState) {
 /// Write the per-product `*.simulation_results.txt` files (12 monthly rows +
 /// annual sum) and the aggregate `totals.simulation_results.txt` (12 monthly
 /// rows + annual) in `state.folder`. The current per-month percentages,
-/// monthly/yearly goals, workday hours and parallel products drive the split.
-/// Returns a human-readable status string.
+/// per-month net-profit goals, and the Full-Year minimum workday / parallel
+/// (used as the reference settings rows) drive the split. Returns a
+/// human-readable status string.
 fn export_results(state: &AppState, lang: &Lang) -> String {
-    let workday_hours = state.slider_value(SliderKind::WorkdayHours);
-    let parallel = state.slider_value(SliderKind::Parallel).max(1);
+    let workday_hours = state.settings.min_workday_hours;
+    let parallel = state.settings.min_parallel.max(1);
 
-    // Per-month, per-product shares.
+    // Per-month, per-product shares (each month uses its own net-profit goal
+    // override via month_shares).
     let per_month: Vec<Vec<crate::simulator::ProductShare>> =
         (0..12).map(|m| month_shares(state, m)).collect();
 
@@ -2414,7 +2866,7 @@ fn state_file_path(folder: &Path) -> PathBuf {
 fn save_state(state: &AppState) {
     let path = state_file_path(&state.folder);
     let mut out = String::new();
-    out.push_str("# tiny-business-simulator state v1\n");
+    out.push_str("# tiny-business-simulator state v2\n");
     out.push_str("# <file> <pct[0..11]> <mlock[0..11]> <ylock>\n");
 
     for (i, (file, _)) in state.products.iter().enumerate() {
@@ -2436,15 +2888,32 @@ fn save_state(state: &AppState) {
         out.push('\n');
     }
 
-    let wh = state.slider_value(SliderKind::WorkdayHours);
-    let par = state.slider_value(SliderKind::Parallel);
-    let mg = state.slider_value(SliderKind::MonthlyGoal);
-    let yg = state.slider_value(SliderKind::YearlyGoal);
-    out.push_str(&format!("workday_hours {}\n", wh));
-    out.push_str(&format!("parallel {}\n", par));
-    out.push_str(&format!("monthly_goal {}\n", mg));
-    out.push_str(&format!("yearly_goal {}\n", yg));
-    out.push_str(&format!("selected_month {}\n", state.selected_month));
+    out.push_str(&format!("min_workday_hours {}\n", state.settings.min_workday_hours));
+    out.push_str(&format!("min_parallel {}\n", state.settings.min_parallel));
+    out.push_str(&format!("min_monthly_net_profit {}\n", state.settings.min_monthly_net_profit));
+    out.push_str(&format!("target_yearly_net_profit {}\n", state.settings.target_yearly_net_profit));
+    out.push_str("month_workday");
+    for m in 0..12 {
+        out.push(' ');
+        out.push_str(&state.month_overrides.workday[m].to_string());
+    }
+    out.push('\n');
+    out.push_str("month_parallel");
+    for m in 0..12 {
+        out.push(' ');
+        out.push_str(&state.month_overrides.parallel[m].to_string());
+    }
+    out.push('\n');
+    out.push_str("month_net_profit");
+    for m in 0..12 {
+        out.push(' ');
+        out.push_str(&state.month_overrides.net_profit[m].to_string());
+    }
+    out.push('\n');
+    match state.period {
+        Period::FullYear => out.push_str("period FullYear\n"),
+        Period::Month(m) => out.push_str(&format!("period Month {}\n", m)),
+    }
 
     let _ = std::fs::write(path, out);
 }
@@ -2455,18 +2924,19 @@ struct LoadedState {
     monthly_pct: Vec<[i64; 12]>,
     month_locked: Vec<[bool; 12]>,
     yearly_locked: Vec<bool>,
-    workday_hours: i64,
-    parallel: i64,
-    monthly_goal: i64,
-    yearly_goal: i64,
-    selected_month: usize,
+    settings: GlobalSettings,
+    month_overrides: MonthOverrides,
+    period: Period,
 }
 
 /// Try to load `.simulation_state` from `folder` and match its per-product
 /// entries to the `products` list (by file name). Returns `None` if the file
 /// doesn't exist or contains no usable data. Each month's percentages are
 /// normalized to sum to 100 in case products were added/removed since the
-/// state was saved.
+/// state was saved. Backward-compatible with the v1 format (the old single
+/// `workday_hours` / `parallel` / `monthly_goal` / `yearly_goal` /
+/// `selected_month` keys are mapped onto the new global minimums + per-month
+/// overrides).
 fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<LoadedState> {
     let path = state_file_path(folder);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -2484,42 +2954,117 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
     let mut monthly_pct = vec![[0i64; 12]; n];
     let mut month_locked = vec![[false; 12]; n];
     let mut yearly_locked = vec![false; n];
-    let mut workday_hours = 8i64;
-    let mut parallel = 1i64;
-    let mut monthly_goal = 1000i64;
-    let mut yearly_goal = 12000i64;
-    let mut selected_month = 0usize;
+    let mut settings = GlobalSettings {
+        min_workday_hours: DEFAULT_MIN_WORKDAY_HOURS,
+        min_parallel: DEFAULT_MIN_PARALLEL,
+        min_monthly_net_profit: DEFAULT_MIN_MONTHLY_NET_PROFIT,
+        target_yearly_net_profit: DEFAULT_TARGET_YEARLY_NET_PROFIT,
+    };
+    let mut month_overrides = MonthOverrides::default();
+    let mut period = Period::FullYear;
     let mut found_any = false;
+
+    // v1 backward-compat temporaries.
+    let mut v1_selected_month: Option<usize> = None;
+
+    let parse_arr12 = |rest: &str| -> Option<[i64; 12]> {
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        if toks.len() < 12 {
+            return None;
+        }
+        let mut a = [0i64; 12];
+        for m in 0..12 {
+            a[m] = toks[m].parse().unwrap_or(0);
+        }
+        Some(a)
+    };
 
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        // Settings lines.
+        // v2 settings lines.
+        if let Some(rest) = line.strip_prefix("min_workday_hours ") {
+            settings.min_workday_hours = rest.trim().parse().unwrap_or(settings.min_workday_hours);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("min_parallel ") {
+            settings.min_parallel = rest.trim().parse().unwrap_or(settings.min_parallel);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("min_monthly_net_profit ") {
+            settings.min_monthly_net_profit =
+                rest.trim().parse().unwrap_or(settings.min_monthly_net_profit);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("target_yearly_net_profit ") {
+            settings.target_yearly_net_profit =
+                rest.trim().parse().unwrap_or(settings.target_yearly_net_profit);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("month_workday ") {
+            if let Some(a) = parse_arr12(rest) {
+                month_overrides.workday = a;
+                found_any = true;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("month_parallel ") {
+            if let Some(a) = parse_arr12(rest) {
+                month_overrides.parallel = a;
+                found_any = true;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("month_net_profit ") {
+            if let Some(a) = parse_arr12(rest) {
+                month_overrides.net_profit = a;
+                found_any = true;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("period ") {
+            let r = rest.trim();
+            period = if r == "FullYear" {
+                Period::FullYear
+            } else if let Some(m) = r.strip_prefix("Month ") {
+                Period::Month(m.trim().parse::<usize>().unwrap_or(0).min(11))
+            } else {
+                Period::FullYear
+            };
+            found_any = true;
+            continue;
+        }
+        // v1 backward-compat settings lines.
         if let Some(rest) = line.strip_prefix("workday_hours ") {
-            workday_hours = rest.trim().parse().unwrap_or(workday_hours);
+            settings.min_workday_hours = rest.trim().parse().unwrap_or(settings.min_workday_hours);
             found_any = true;
             continue;
         }
         if let Some(rest) = line.strip_prefix("parallel ") {
-            parallel = rest.trim().parse().unwrap_or(parallel);
+            settings.min_parallel = rest.trim().parse().unwrap_or(settings.min_parallel);
             found_any = true;
             continue;
         }
         if let Some(rest) = line.strip_prefix("monthly_goal ") {
-            monthly_goal = rest.trim().parse().unwrap_or(monthly_goal);
+            settings.min_monthly_net_profit =
+                rest.trim().parse().unwrap_or(settings.min_monthly_net_profit);
             found_any = true;
             continue;
         }
         if let Some(rest) = line.strip_prefix("yearly_goal ") {
-            yearly_goal = rest.trim().parse().unwrap_or(yearly_goal);
+            settings.target_yearly_net_profit =
+                rest.trim().parse().unwrap_or(settings.target_yearly_net_profit);
             found_any = true;
             continue;
         }
         if let Some(rest) = line.strip_prefix("selected_month ") {
-            let v: usize = rest.trim().parse().unwrap_or(0);
-            selected_month = v.min(11);
+            v1_selected_month = Some(rest.trim().parse::<usize>().unwrap_or(0).min(11));
             found_any = true;
             continue;
         }
@@ -2543,6 +3088,30 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
         return None;
     }
 
+    // v1 backward-compat: if a selected_month was saved but no v2 `period`
+    // line was present, restore that month as the active period.
+    if matches!(period, Period::FullYear) {
+        if let Some(m) = v1_selected_month {
+            period = Period::Month(m);
+        }
+    }
+
+    // Clamp overrides to the loaded minimums (the minimums may have changed).
+    let mw = settings.min_workday_hours;
+    let mp = settings.min_parallel;
+    let mn = settings.min_monthly_net_profit;
+    for m in 0..12 {
+        if month_overrides.workday[m] < mw {
+            month_overrides.workday[m] = mw;
+        }
+        if month_overrides.parallel[m] < mp {
+            month_overrides.parallel[m] = mp;
+        }
+        if month_overrides.net_profit[m] < mn {
+            month_overrides.net_profit[m] = mn;
+        }
+    }
+
     // Normalize each month to sum to exactly 100 (products may have been
     // added/removed since the state was saved).
     for m in 0..12 {
@@ -2556,10 +3125,6 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
                 let new_sum: i64 = monthly_pct.iter().map(|p| p[m]).sum();
                 let diff = 100 - new_sum;
                 if diff != 0 && n > 0 {
-                    // Apply the rounding drift to the first non-locked
-                    // product. If every product is locked (edge case),
-                    // fall back to the first product so the month still
-                    // sums to exactly 100.
                     let mut applied = false;
                     for i in 0..n {
                         if !month_locked[i][m] && !yearly_locked[i] {
@@ -2573,7 +3138,6 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
                     }
                 }
             } else if n > 0 {
-                // All zero: equal split.
                 let base = 100 / n as i64;
                 let extra = 100 - base * n as i64;
                 for i in 0..n {
@@ -2587,56 +3151,101 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
         monthly_pct,
         month_locked,
         yearly_locked,
-        workday_hours,
-        parallel,
-        monthly_goal,
-        yearly_goal,
-        selected_month,
+        settings,
+        month_overrides,
+        period,
     })
 }
 
-/// Default settings slider for a given kind (used on first build before any
-/// prior slider state exists).
-fn default_settings_slider(kind: SliderKind, lang: &Lang) -> Slider {
-    let d = lang.dict();
+/// Build a settings slider for the given kind, reading its value / range from
+/// `state`. Used by [`AppState::rebuild_sliders`].
+fn make_settings_slider(kind: SliderKind, state: &AppState) -> Slider {
+    let d = state.lang.dict();
     match kind {
-        SliderKind::WorkdayHours => Slider {
+        SliderKind::MinWorkdayHours => Slider {
             kind,
-            label: d.tui_slider_workday.into(),
-            value: 8,
+            label: d.tui_slider_min_workday.into(),
+            value: state.settings.min_workday_hours,
             min: 1,
             max: 24,
             step: 1,
             suffix: " h",
             locked: false,
         },
-        SliderKind::Parallel => Slider {
+        SliderKind::MinParallel => Slider {
             kind,
-            label: d.tui_slider_parallel.into(),
-            value: 1,
+            label: d.tui_slider_min_parallel.into(),
+            value: state.settings.min_parallel,
             min: 1,
             max: 200,
             step: 1,
             suffix: "",
             locked: false,
         },
-        SliderKind::MonthlyGoal => Slider {
+        SliderKind::MinMonthlyNetProfit => Slider {
             kind,
-            label: d.tui_slider_monthly_goal.into(),
-            value: 1000,
+            label: d.tui_slider_min_monthly_profit.into(),
+            value: state.settings.min_monthly_net_profit,
             min: 0,
             max: 1_000_000,
             step: 100,
             suffix: "",
             locked: false,
         },
-        SliderKind::YearlyGoal => Slider {
+        SliderKind::TargetYearlyNetProfit => Slider {
             kind,
-            label: d.tui_slider_yearly_goal.into(),
-            value: 12000,
+            label: d.tui_slider_target_yearly.into(),
+            value: state.settings.target_yearly_net_profit,
             min: 0,
             max: 10_000_000,
             step: 1000,
+            suffix: "",
+            locked: false,
+        },
+        SliderKind::MonthWorkdayHours(m) => Slider {
+            kind,
+            label: d.tui_slider_month_workday.into(),
+            value: state.month_overrides.workday[m].max(state.settings.min_workday_hours),
+            min: state.settings.min_workday_hours.max(1),
+            max: 24,
+            step: 1,
+            suffix: " h",
+            locked: false,
+        },
+        SliderKind::MonthParallel(m) => {
+            // The max is refined by `update_parallel_range`; start with a
+            // generous upper bound so the slider is usable before that runs.
+            let min_par = state.settings.min_parallel.max(1);
+            let monthly_minutes: f64 =
+                month_shares(state, m).iter().map(|s| s.monthly_minutes).sum();
+            let wh = state.workday_hours(m).max(1) as f64;
+            let max_par = ((monthly_minutes / 60.0) / wh).floor() as i64;
+            let max_par = max_par.max(min_par);
+            let val = state.month_overrides.parallel[m].max(min_par).min(max_par);
+            Slider {
+                kind,
+                label: lang::fmt(
+                    d.tui_parallel_label,
+                    &[&min_par.to_string(), &max_par.to_string()],
+                ),
+                value: val,
+                min: min_par,
+                max: max_par,
+                step: 1,
+                suffix: "",
+                locked: false,
+            }
+        }
+        SliderKind::MonthNetProfit(m) => Slider {
+            kind,
+            label: d.tui_slider_month_profit.into(),
+            value: state
+                .month_overrides
+                .net_profit[m]
+                .max(state.settings.min_monthly_net_profit),
+            min: state.settings.min_monthly_net_profit.max(0),
+            max: 1_000_000,
+            step: 100,
             suffix: "",
             locked: false,
         },
@@ -2654,15 +3263,14 @@ fn default_settings_slider(kind: SliderKind, lang: &Lang) -> Slider {
 }
 
 impl AppState {
-    /// Rebuild the flat `sliders` view from the current tab + selected month.
-    /// The top region holds yearly sliders (Products tab) or the month selector
-    /// + monthly sliders (Graph tab); the bottom 4 sliders are always the
-    /// settings, preserved from the previous build (so their values / the
-    /// parallel slider's dynamic min/max/label survive across rebuilds).
+    /// Rebuild the flat `sliders` view from the current period.  Full Year:
+    /// yearly % sliders + the 4 global min/target settings.  A Month: that
+    /// month's monthly % sliders + the 3 per-month override settings.  Values
+    /// are read from the state (percentages / settings / overrides).
     fn rebuild_sliders(&mut self) {
         let mut sliders: Vec<Slider> = Vec::new();
-        match self.tab {
-            Tab::Products => {
+        match self.period {
+            Period::FullYear => {
                 for i in 0..self.products.len() {
                     sliders.push(Slider {
                         kind: SliderKind::YearlyPercent(i),
@@ -2675,19 +3283,16 @@ impl AppState {
                         locked: self.yearly_locked[i],
                     });
                 }
+                for kind in [
+                    SliderKind::MinWorkdayHours,
+                    SliderKind::MinParallel,
+                    SliderKind::MinMonthlyNetProfit,
+                    SliderKind::TargetYearlyNetProfit,
+                ] {
+                    sliders.push(make_settings_slider(kind, self));
+                }
             }
-            Tab::Graph => {
-                sliders.push(Slider {
-                    kind: SliderKind::MonthSelector,
-                    label: self.lang.dict().tui_slider_month.into(),
-                    value: self.selected_month as i64,
-                    min: 0,
-                    max: 11,
-                    step: 1,
-                    suffix: "",
-                    locked: false,
-                });
-                let m = self.selected_month;
+            Period::Month(m) => {
                 for i in 0..self.products.len() {
                     let eff_locked = self.month_locked[i][m] || self.yearly_locked[i];
                     sliders.push(Slider {
@@ -2701,19 +3306,13 @@ impl AppState {
                         locked: eff_locked,
                     });
                 }
-            }
-        }
-        // Preserve the 4 settings sliders from the previous build.
-        for kind in [
-            SliderKind::WorkdayHours,
-            SliderKind::Parallel,
-            SliderKind::MonthlyGoal,
-            SliderKind::YearlyGoal,
-        ] {
-            if let Some(old) = self.sliders.iter().find(|s| s.kind == kind).cloned() {
-                sliders.push(old);
-            } else {
-                sliders.push(default_settings_slider(kind, &self.lang));
+                for kind in [
+                    SliderKind::MonthWorkdayHours(m),
+                    SliderKind::MonthParallel(m),
+                    SliderKind::MonthNetProfit(m),
+                ] {
+                    sliders.push(make_settings_slider(kind, self));
+                }
             }
         }
         self.sliders = sliders;
@@ -2747,14 +3346,28 @@ pub fn run(folder: &Path, lang: &Lang) {
         })
         .collect();
 
-    let (monthly_pct, month_locked, yearly_locked, selected_month) = match &loaded {
+    let (monthly_pct, month_locked, yearly_locked, period, settings, month_overrides) = match &loaded {
         Some(l) => (
             l.monthly_pct.clone(),
             l.month_locked.clone(),
             l.yearly_locked.clone(),
-            l.selected_month,
+            l.period,
+            l.settings,
+            l.month_overrides.clone(),
         ),
-        None => (default_monthly, vec![[false; 12]; n], vec![false; n], 0),
+        None => (
+            default_monthly,
+            vec![[false; 12]; n],
+            vec![false; n],
+            Period::FullYear,
+            GlobalSettings {
+                min_workday_hours: DEFAULT_MIN_WORKDAY_HOURS,
+                min_parallel: DEFAULT_MIN_PARALLEL,
+                min_monthly_net_profit: DEFAULT_MIN_MONTHLY_NET_PROFIT,
+                target_yearly_net_profit: DEFAULT_TARGET_YEARLY_NET_PROFIT,
+            },
+            MonthOverrides::default(),
+        ),
     };
 
     let mut state = AppState {
@@ -2762,7 +3375,7 @@ pub fn run(folder: &Path, lang: &Lang) {
         monthly_pct,
         month_locked,
         yearly_locked,
-        selected_month,
+        period,
         folder: folder.to_path_buf(),
         products,
         selected: 0,
@@ -2774,22 +3387,10 @@ pub fn run(folder: &Path, lang: &Lang) {
         active_region: Region::Main,
         show_help: false,
         help_scroll: 0,
+        settings,
+        month_overrides,
     };
-    // Apply loaded settings (workday, parallel, goals) if present.
-    if let Some(l) = &loaded {
-        state.rebuild_sliders();
-        for s in state.sliders.iter_mut() {
-            match s.kind {
-                SliderKind::WorkdayHours => s.value = l.workday_hours,
-                SliderKind::Parallel => s.value = l.parallel,
-                SliderKind::MonthlyGoal => s.value = l.monthly_goal,
-                SliderKind::YearlyGoal => s.value = l.yearly_goal,
-                _ => {}
-            }
-        }
-    } else {
-        state.rebuild_sliders();
-    }
+    state.rebuild_sliders();
     // Set the initial parallel-products cap range from the default goals.
     update_parallel_range(&mut state);
 

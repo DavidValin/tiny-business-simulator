@@ -39,7 +39,7 @@ fn make_state(products: Vec<ProductResult>) -> AppState {
         monthly_pct,
         month_locked: vec![[false; 12]; n],
         yearly_locked: vec![false; n],
-        selected_month: 0,
+        period: Period::FullYear,
         sliders: Vec::new(),
         selected: 0,
         scroll: 0,
@@ -51,29 +51,32 @@ fn make_state(products: Vec<ProductResult>) -> AppState {
         active_region: Region::Main,
         show_help: false,
         help_scroll: 0,
+        settings: GlobalSettings {
+            min_workday_hours: DEFAULT_MIN_WORKDAY_HOURS,
+            min_parallel: DEFAULT_MIN_PARALLEL,
+            min_monthly_net_profit: DEFAULT_MIN_MONTHLY_NET_PROFIT,
+            target_yearly_net_profit: DEFAULT_TARGET_YEARLY_NET_PROFIT,
+        },
+        month_overrides: MonthOverrides::default(),
     };
     state.rebuild_sliders();
     state
 }
 
-/// Set a settings slider value by kind (workday / parallel / goals).
-fn set_setting(state: &mut AppState, kind: SliderKind, value: i64) {
-    if let Some(s) = state.sliders.iter_mut().find(|s| s.kind == kind) {
-        s.value = value;
+/// Set every month's net-profit override to `goal` and workday/parallel to
+/// `workday`/`parallel` (clamped to the global minimums).
+fn set_all_months(state: &mut AppState, workday: i64, parallel: i64, goal: i64) {
+    for m in 0..12 {
+        state.month_overrides.workday[m] = workday.max(state.settings.min_workday_hours);
+        state.month_overrides.parallel[m] = parallel.max(state.settings.min_parallel);
+        state.month_overrides.net_profit[m] = goal.max(state.settings.min_monthly_net_profit);
     }
-}
-
-/// Read a settings slider value by kind.
-#[allow(dead_code)]
-fn get_setting(state: &AppState, kind: SliderKind) -> i64 {
-    state.slider_value(kind)
 }
 
 #[test]
 fn share_for_month_normalizes_percentages() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let state = make_state(products);
-    // Equal 50/50 split -> equal shares in every month.
     for m in 0..12 {
         assert!((state.share_for_month(0, m) - 0.5).abs() < 1e-9);
         assert!((state.share_for_month(1, m) - 0.5).abs() < 1e-9);
@@ -84,7 +87,6 @@ fn share_for_month_normalizes_percentages() {
 fn share_for_month_all_zero_splits_equally() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
-    // Zero every month for every product -> equal split fallback.
     for p in &mut state.monthly_pct {
         *p = [0; 12];
     }
@@ -95,7 +97,6 @@ fn share_for_month_all_zero_splits_equally() {
 fn yearly_pct_is_mean_of_months() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
-    // Make Jan 80/20 and the rest 50/50 -> mean for A = (80 + 11*50)/12.
     state.monthly_pct[0][0] = 80;
     state.monthly_pct[1][0] = 20;
     let expected: f64 = (80.0 + 11.0 * 50.0) / 12.0;
@@ -104,15 +105,15 @@ fn yearly_pct_is_mean_of_months() {
 
 #[test]
 fn month_totals_scales_down_when_capacity_exceeds() {
-    // One product, net profit 5, duration 60 min.  Goal 1000 -> 200 sales
-    // -> 12000 required minutes.  With 1h/day, 1 parallel, 22 days ->
-    // capacity = 1*22*60 = 1320 min.  Scale = 1320/12000 = 0.11 ->
+    // One product, net profit 5, duration 60 min. Goal 1000 -> 200 sales
+    // -> 12000 required minutes. With 1h/day, 1 parallel, 22 days ->
+    // capacity = 1*22*60 = 1320 min. Scale = 1320/12000 = 0.11 ->
     // floor(200*0.11) = 22 units, amount = 22*10 = 220.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
-    set_setting(&mut state, SliderKind::WorkdayHours, 1);
-    set_setting(&mut state, SliderKind::Parallel, 1);
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 1000);
+    state.period = Period::Month(0);
     let mt = state.month_totals();
     assert_eq!(mt.units, 22);
     assert!((mt.amount - 220.0).abs() < 1e-9);
@@ -124,9 +125,8 @@ fn month_totals_scales_down_when_capacity_exceeds() {
 fn month_totals_unchanged_when_capacity_sufficient() {
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
-    set_setting(&mut state, SliderKind::WorkdayHours, 24);
-    set_setting(&mut state, SliderKind::Parallel, 10);
+    set_all_months(&mut state, 24, 10, 1000);
+    state.period = Period::Month(0);
     let mt = state.month_totals();
     assert_eq!(mt.units, 200);
     assert!((mt.amount - 2000.0).abs() < 1e-9);
@@ -141,7 +141,7 @@ fn month_totals_differ_per_month() {
     // mix differs — verify via month_shares that Jan and Feb differ.
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+    set_all_months(&mut state, 8, 1, 1000);
     state.monthly_pct[0][0] = 80;
     state.monthly_pct[1][0] = 20;
     state.monthly_pct[0][1] = 20;
@@ -156,7 +156,7 @@ fn month_totals_differ_per_month() {
 #[test]
 fn slider_clamps_and_steps() {
     let mut s = Slider {
-        kind: SliderKind::WorkdayHours,
+        kind: SliderKind::MinWorkdayHours,
         label: "x".into(),
         value: 8,
         min: 1,
@@ -187,7 +187,7 @@ fn fit_bar_width_fills_available_width() {
 #[test]
 fn slider_track_fills_proportionally() {
     let s = Slider {
-        kind: SliderKind::WorkdayHours,
+        kind: SliderKind::MinWorkdayHours,
         label: "x".into(),
         value: 12,
         min: 0,
@@ -220,8 +220,6 @@ fn initial_monthly_percentages_sum_to_100() {
 
 #[test]
 fn redistribute_month_keeps_total_at_100() {
-    // 50/30/20. Raise A to 60 -> remainder 40 split EQUALLY across the two
-    // non-locked others (including zeros): 20 / 20.
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -241,9 +239,6 @@ fn redistribute_month_keeps_total_at_100() {
 
 #[test]
 fn redistribute_month_includes_zero_products() {
-    // A=50, B=30, C=0. Raise A to 60 -> remainder 40 split equally across
-    // ALL non-locked others (including C at 0): B=20, C=20. (New behaviour:
-    // zeros are receivers, unlike the old yearly-only redistribute.)
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -261,8 +256,6 @@ fn redistribute_month_includes_zero_products() {
 
 #[test]
 fn redistribute_month_freezes_locked_product() {
-    // A=50, B=30, C=20. Lock B (month-lock) at 30, raise A to 60: remainder
-    // 10 goes only to the non-locked C.
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -275,14 +268,12 @@ fn redistribute_month_freezes_locked_product() {
     state.month_locked[1][0] = true;
     redistribute_month(&mut state, 0, 0, 60);
     assert_eq!(state.monthly_pct[0][0], 60);
-    assert_eq!(state.monthly_pct[1][0], 30); // frozen
-    assert_eq!(state.monthly_pct[2][0], 10); // absorbed the whole remainder
+    assert_eq!(state.monthly_pct[1][0], 30);
+    assert_eq!(state.monthly_pct[2][0], 10);
 }
 
 #[test]
 fn redistribute_month_clamped_by_locked_room() {
-    // Lock B=30 and C=50 (locked_sum=80). Raise A above the available 20:
-    // it clamps to 20 so the sum stays exactly 100.
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -314,14 +305,12 @@ fn redistribute_month_locked_changed_is_noop() {
 
 #[test]
 fn redistribute_month_yearly_locked_is_frozen() {
-    // Yearly-lock on B freezes it in every month.
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     state.yearly_locked[1] = true;
     let before = state.monthly_pct[1][3];
     redistribute_month(&mut state, 3, 0, 60);
     assert_eq!(state.monthly_pct[1][3], before);
-    // B is frozen at 50, so A is clamped to 100 - 50 = 50 (not 60).
     assert_eq!(state.monthly_pct[0][3], 50);
     assert_eq!(state.monthly_pct[1][3], 50);
 }
@@ -330,8 +319,6 @@ fn redistribute_month_yearly_locked_is_frozen() {
 
 #[test]
 fn edit_yearly_propagates_to_all_months() {
-    // 2 products 50/50. Edit yearly A to 80: every month becomes A=80/B=20
-    // (no month-locks), and the yearly mean recompute = 80.
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     edit_yearly(&mut state, 0, 80);
@@ -344,14 +331,11 @@ fn edit_yearly_propagates_to_all_months() {
 
 #[test]
 fn edit_yearly_skips_month_locked_months() {
-    // Lock A in month 3 at 50. Edit yearly A to 80: month 3 stays 50, the
-    // other 11 months become 80. Yearly mean = (11*80 + 50)/12 ≈ 77.5,
-    // NOT 80 — the "unless locked" behaviour.
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     state.month_locked[0][3] = true;
     edit_yearly(&mut state, 0, 80);
-    assert_eq!(state.monthly_pct[0][3], 50); // month-locked, unchanged
+    assert_eq!(state.monthly_pct[0][3], 50);
     for m in 0..12 {
         if m != 3 {
             assert_eq!(state.monthly_pct[0][m], 80, "month {}", m);
@@ -374,11 +358,9 @@ fn edit_yearly_locked_product_is_noop() {
 
 #[test]
 fn monthly_edit_recomputes_yearly_as_mean() {
-    // 2 products 50/50. Edit month 0 A to 80 -> month 0 = 80/20, other
-    // months stay 50/50. Yearly A = (80 + 11*50)/12 ≈ 52.5 -> 52 (rounded).
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
-    state.selected_month = 0;
+    state.period = Period::Month(0);
     redistribute_month(&mut state, 0, 0, 80);
     let expected: f64 = (80.0 + 11.0 * 50.0) / 12.0;
     assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
@@ -386,12 +368,10 @@ fn monthly_edit_recomputes_yearly_as_mean() {
 
 #[test]
 fn yearly_lock_renders_month_checkbox_checked_and_greyed() {
-    // When a product is yearly-locked, its monthly slider in the Graph tab
-    // must render locked (checked) regardless of month_locked.
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     state.yearly_locked[0] = true;
-    state.tab = Tab::Graph;
+    state.period = Period::Month(3);
     state.rebuild_sliders();
     let a_month = state
         .sliders
@@ -399,25 +379,25 @@ fn yearly_lock_renders_month_checkbox_checked_and_greyed() {
         .find(|s| matches!(s.kind, SliderKind::MonthPercent(0)))
         .unwrap();
     assert!(a_month.locked, "monthly slider must be locked when yearly-locked");
-    // Toggling its month-lock via Space must be ignored (yearly-locked).
-    // (Covered by handle_key logic; here we just assert the effective lock.)
 }
 
-// --- parallel range / totals / export -----------------------------------
+// --- per-month parallel range / totals / export ---------------------------
 
 #[test]
-fn parallel_slider_range_caps_to_workday_budget() {
+fn month_parallel_range_caps_to_one_workday() {
+    // 1 product, net 5, dur 60, goal 1000 -> 200 sales -> 12000 min ->
+    // 200 monthly hours. workday 8 -> max_par = floor(200/8) = 25.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
-    set_setting(&mut state, SliderKind::YearlyGoal, 12000);
-    set_setting(&mut state, SliderKind::WorkdayHours, 8);
-    set_setting(&mut state, SliderKind::Parallel, 1);
+    set_all_months(&mut state, 8, 1, 1000);
+    state.settings.target_yearly_net_profit = 12000;
+    state.period = Period::Month(0);
+    state.rebuild_sliders();
     update_parallel_range(&mut state);
     let p = state
         .sliders
         .iter()
-        .find(|s| s.kind == SliderKind::Parallel)
+        .find(|s| matches!(s.kind, SliderKind::MonthParallel(_)))
         .unwrap();
     assert_eq!(p.min, 1);
     assert_eq!(p.max, 25);
@@ -425,22 +405,25 @@ fn parallel_slider_range_caps_to_workday_budget() {
 }
 
 #[test]
-fn parallel_slider_clamps_when_goal_raises_min() {
+fn month_parallel_clamps_value_into_range() {
+    // Goal 100000, workday 1 -> 20000 monthly hours -> max_par = 20000.
+    // Setting the override above the max clamps it down to the max.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 100000);
-    set_setting(&mut state, SliderKind::YearlyGoal, 0);
-    set_setting(&mut state, SliderKind::WorkdayHours, 1);
-    set_setting(&mut state, SliderKind::Parallel, 1);
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 100000);
+    state.period = Period::Month(0);
+    state.month_overrides.parallel[0] = 999_999;
+    state.rebuild_sliders();
     update_parallel_range(&mut state);
+    assert_eq!(state.month_overrides.parallel[0], 20000);
     let p = state
         .sliders
         .iter()
-        .find(|s| s.kind == SliderKind::Parallel)
+        .find(|s| matches!(s.kind, SliderKind::MonthParallel(_)))
         .unwrap();
-    assert_eq!(p.min, 667);
-    assert_eq!(p.value, 667);
-    assert!(p.max >= p.min);
+    assert_eq!(p.value, 20000);
+    assert_eq!(p.max, 20000);
 }
 
 #[test]
@@ -451,17 +434,13 @@ fn compute_totals_monthly_and_annual() {
     // 12 * monthly (all months equal).
     let products = vec![prod("A", 6.0, 1.0, 5.0), prod("B", 12.0, 2.0, 10.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
-    set_setting(&mut state, SliderKind::YearlyGoal, 12000);
-    set_setting(&mut state, SliderKind::WorkdayHours, 8);
-    set_setting(&mut state, SliderKind::Parallel, 1);
+    set_all_months(&mut state, 8, 1, 1000);
+    state.period = Period::Month(0);
     let t = compute_totals(&state);
     assert_eq!(t.monthly.sales, 150);
     assert!((t.monthly.minutes - 1000.0).abs() < 1e-6);
     assert_eq!(t.annual.sales, 150 * 12);
     assert!((t.annual.minutes - 12000.0).abs() < 1e-6);
-    assert_eq!(t.workday_hours, 8);
-    assert_eq!(t.parallel, 1);
 }
 
 #[test]
@@ -495,7 +474,7 @@ fn export_results_writes_12_monthly_rows_and_totals() {
         monthly_pct,
         month_locked: vec![[false; 12]; n],
         yearly_locked: vec![false; n],
-        selected_month: 0,
+        period: Period::FullYear,
         sliders: Vec::new(),
         selected: 0,
         scroll: 0,
@@ -506,15 +485,21 @@ fn export_results_writes_12_monthly_rows_and_totals() {
         active_region: Region::Main,
         show_help: false,
         help_scroll: 0,
+        settings: GlobalSettings {
+            min_workday_hours: DEFAULT_MIN_WORKDAY_HOURS,
+            min_parallel: DEFAULT_MIN_PARALLEL,
+            min_monthly_net_profit: DEFAULT_MIN_MONTHLY_NET_PROFIT,
+            target_yearly_net_profit: DEFAULT_TARGET_YEARLY_NET_PROFIT,
+        },
+        month_overrides: MonthOverrides::default(),
     };
     state.rebuild_sliders();
-    set_setting(&mut state, SliderKind::MonthlyGoal, 500);
+    set_all_months(&mut state, 8, 1, 500);
 
     let status = export_results(&state, &Lang::En);
     assert!(status.contains("exported"), "status was: {}", status);
 
     let product_file = std::fs::read_to_string(dir.join("p0.simulation_results.txt")).unwrap();
-    // All 12 month abbreviations appear in the per-product file.
     for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] {
         assert!(product_file.contains(m), "per-product file missing month {}, was:\n{}", m, product_file);
     }
@@ -567,16 +552,18 @@ fn settings_renders_two_columns_side_by_side() {
     terminal.draw(|f| draw(f, &mut state)).unwrap();
     let buf = terminal.backend().buffer().clone();
 
+    // Full Year settings: labels "min. workday hours" and "min. monthly net
+    // profit" must render side by side with a vertical separator between them.
     let settings_y = (0..buf.area.height)
-        .find_map(|y| find_in_row(&buf, y, "Settings").map(|_| y))
+        .find_map(|y| find_in_row(&buf, y, "Global settings").map(|_| y))
         .expect("Settings title not rendered");
     let header = (settings_y..buf.area.height)
         .find_map(|y| {
-            let w = find_in_row(&buf, y, "Workday")?;
-            let m = find_in_row(&buf, y, "Monthly")?;
+            let w = find_in_row(&buf, y, "workday")?;
+            let m = find_in_row(&buf, y, "monthly")?;
             Some((y, w, m))
         })
-        .expect("Workday/Monthly not rendered side by side in Settings");
+        .expect("workday/monthly labels not rendered side by side in Settings");
     let (_, workday_x, monthly_x) = header;
     assert!(monthly_x > workday_x);
 
@@ -599,6 +586,9 @@ fn totals_renders_two_columns_side_by_side() {
         prod("B", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
+    // A Month period renders Monthly (left) + Yearly (right) in the Totals.
+    state.period = Period::Month(0);
+    state.rebuild_sliders();
     update_parallel_range(&mut state);
 
     let backend = TestBackend::new(80, 40);
@@ -661,15 +651,14 @@ fn sidebar_padding_clamps_to_fit_all_product_rows() {
 }
 
 #[test]
-fn graph_sidebar_renders_month_selector() {
+fn period_bar_renders_full_year_and_selected_month() {
     use ratatui::backend::TestBackend;
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
-    state.tab = Tab::Graph;
-    state.selected_month = 5; // Jun
+    state.period = Period::Month(5); // Jun
     state.rebuild_sliders();
     update_parallel_range(&mut state);
 
@@ -678,16 +667,20 @@ fn graph_sidebar_renders_month_selector() {
     terminal.draw(|f| draw(f, &mut state)).unwrap();
     let buf = terminal.backend().buffer().clone();
 
-    // The Graph sidebar's top-block title carries the selected month name.
+    // The top period bar row shows "Full Year" and every month abbreviation
+    // (including the selected Jun).
     assert!(
-        find_in_row(&buf, 0, "Jun (% sales)").is_some()
-            || (0..buf.area.height).any(|y| find_in_row(&buf, y, "Jun").is_some()),
-        "selected month Jun not rendered in Graph sidebar title"
+        find_in_row(&buf, 0, "Full Year").is_some(),
+        "Full Year tab not rendered in the period bar"
     );
-    // The month selector slider label "Month" is rendered.
     assert!(
-        (0..buf.area.height).any(|y| find_in_row(&buf, y, "Month").is_some()),
-        "Month selector not rendered"
+        find_in_row(&buf, 0, "Jun").is_some(),
+        "selected month Jun not rendered in the period bar"
+    );
+    // The sub-tab bar (Products/Graph) renders on row 2, below the separator.
+    assert!(
+        (0..buf.area.height).any(|y| find_in_row(&buf, y, "Products").is_some()),
+        "Products sub-tab not rendered"
     );
 }
 
@@ -697,7 +690,6 @@ fn save_then_load_state_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Two product definition files.
     let products = vec![
         prod("Coffee", 4.5, 1.15, 5.0),
         prod("Tea", 3.0, 0.8, 4.0),
@@ -723,7 +715,7 @@ fn save_then_load_state_roundtrip() {
         monthly_pct,
         month_locked: vec![[false; 12]; n],
         yearly_locked: vec![false; n],
-        selected_month: 3,
+        period: Period::Month(3),
         sliders: Vec::new(),
         selected: 0,
         scroll: 0,
@@ -734,6 +726,13 @@ fn save_then_load_state_roundtrip() {
         help_scroll: 0,
         lang: Lang::En,
         active_region: Region::Main,
+        settings: GlobalSettings {
+            min_workday_hours: DEFAULT_MIN_WORKDAY_HOURS,
+            min_parallel: DEFAULT_MIN_PARALLEL,
+            min_monthly_net_profit: DEFAULT_MIN_MONTHLY_NET_PROFIT,
+            target_yearly_net_profit: DEFAULT_TARGET_YEARLY_NET_PROFIT,
+        },
+        month_overrides: MonthOverrides::default(),
     };
     state.rebuild_sliders();
 
@@ -744,28 +743,24 @@ fn save_then_load_state_roundtrip() {
     state.month_locked[0][3] = true;
     // Yearly-lock product 1.
     state.yearly_locked[1] = true;
-    // Change a setting.
-    for s in state.sliders.iter_mut() {
-        if s.kind == SliderKind::MonthlyGoal {
-            s.value = 500;
-        }
-        if s.kind == SliderKind::WorkdayHours {
-            s.value = 6;
-        }
-    }
+    // Change settings + a per-month override.
+    state.settings.min_workday_hours = 6;
+    state.settings.min_monthly_net_profit = 400;
+    state.month_overrides.net_profit[0] = 750;
+    state.month_overrides.workday[1] = 10;
 
-    // Save state.
     save_state(&state);
 
-    // Load state back.
     let loaded = load_state(&dir, &paths).expect("state should load");
     assert_eq!(loaded.monthly_pct[0][0], 80);
     assert_eq!(loaded.monthly_pct[1][0], 20);
     assert!(loaded.month_locked[0][3]);
     assert!(loaded.yearly_locked[1]);
-    assert_eq!(loaded.selected_month, 3);
-    assert_eq!(loaded.monthly_goal, 500);
-    assert_eq!(loaded.workday_hours, 6);
+    assert_eq!(loaded.period, Period::Month(3));
+    assert_eq!(loaded.settings.min_workday_hours, 6);
+    assert_eq!(loaded.settings.min_monthly_net_profit, 400);
+    assert_eq!(loaded.month_overrides.net_profit[0], 750);
+    assert_eq!(loaded.month_overrides.workday[1], 10);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -797,7 +792,6 @@ fn load_state_normalizes_when_product_added() {
     )
     .unwrap();
 
-    // Now load with 3 products (p2 was added since the save).
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -808,15 +802,11 @@ fn load_state_normalizes_when_product_added() {
         .enumerate()
         .map(|(i, r)| (dir.join(format!("p{}.txt", i)), r))
         .collect();
-    // Create p2.txt so the file exists.
     std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
 
     let loaded = load_state(&dir, &paths).expect("state should load");
-    // p0 and p1 keep their saved percentages.
     assert_eq!(loaded.monthly_pct[0][0], 80);
     assert_eq!(loaded.monthly_pct[1][0], 20);
-    // p2 was not in the save → 0. After normalization the month sums to
-    // 100 (80+20+0=100, already correct).
     assert_eq!(loaded.monthly_pct[2][0], 0);
     let sum: i64 = loaded.monthly_pct.iter().map(|p| p[0]).sum();
     assert_eq!(sum, 100);
@@ -830,7 +820,6 @@ fn load_state_normalizes_when_product_removed() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Save state with 3 products (p0=34, p1=33, p2=33 in Jan → sum=100).
     std::fs::write(dir.join("p0.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
@@ -842,7 +831,6 @@ fn load_state_normalizes_when_product_removed() {
     )
     .unwrap();
 
-    // Load with 2 products (p2 was removed since the save).
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -854,8 +842,6 @@ fn load_state_normalizes_when_product_removed() {
         .collect();
 
     let loaded = load_state(&dir, &paths).expect("state should load");
-    // After normalization the month must sum to 100 even though p2 is gone
-    // (34+33=67 → scaled to 100).
     let sum: i64 = loaded.monthly_pct.iter().map(|p| p[0]).sum();
     assert_eq!(sum, 100, "month must sum to 100 after product removal");
 
@@ -868,10 +854,6 @@ fn load_state_normalizes_when_all_products_locked() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Save state with 3 products, ALL yearly-locked, with values that cause
-    // rounding drift: 34 + 34 + 34 = 102. After scaling (each becomes
-    // round(34/102*100)=33 → sum 99, diff=+1) the drift fix must apply even
-    // though no non-locked product exists.
     std::fs::write(dir.join("p0.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
@@ -909,19 +891,13 @@ fn load_state_normalizes_when_all_products_locked() {
 
 #[test]
 fn totals_match_capped_chart_values() {
-    // When capacity is exceeded, the Totals sidebar must show the same
-    // achievable (capped) sales as the chart, not the required (uncapped)
-    // figures.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
-    set_setting(&mut state, SliderKind::WorkdayHours, 1);
-    set_setting(&mut state, SliderKind::Parallel, 1);
-    // Chart: capacity = 1*22*60 = 1320 min, required = 200*60 = 12000 min.
-    // Scale = 1320/12000 = 0.11 -> floor(200*0.11) = 22 units.
-    let mt = state.month_totals_for(state.selected_month);
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 1000);
+    state.period = Period::Month(0);
+    let mt = state.month_totals_for(state.period.month().unwrap());
     assert_eq!(mt.units, 22);
-    // Totals sidebar must agree with the chart.
     let t = compute_totals(&state);
     assert_eq!(
         t.monthly.sales, 22,
@@ -936,19 +912,15 @@ fn totals_match_capped_chart_values() {
 #[test]
 fn donut_uses_capped_sales() {
     // The "vs year" donut should use capped (achievable) sales, not required.
-    // With capacity exceeded, the donut should show < 100% of the yearly goal.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
-    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
-    set_setting(&mut state, SliderKind::YearlyGoal, 12000);
-    set_setting(&mut state, SliderKind::WorkdayHours, 1);
-    set_setting(&mut state, SliderKind::Parallel, 1);
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 1000);
+    state.settings.target_yearly_net_profit = 12000;
 
-    // Capped annual sales = 22/month * 12 = 264 (not 200*12=2400).
     let capped_annual: i64 = (0..12).map(|m| state.capped_product_sales(m)[0]).sum();
     assert_eq!(capped_annual, 264);
 
-    // The yearly profit from capped sales is well below the yearly goal.
     let yearly_profit = capped_annual as f64 * 5.0; // 1320
     let of_goal = yearly_profit / 12000.0 * 100.0; // 11%
     assert!(
@@ -957,9 +929,68 @@ fn donut_uses_capped_sales() {
         of_goal
     );
 
-    // Uncapped would show 200% — verify the capped value differs.
     let uncapped_annual: i64 = (0..12)
         .map(|m| month_shares(&state, m)[0].monthly_sales)
         .sum();
     assert_ne!(capped_annual, uncapped_annual);
+}
+
+#[test]
+fn raising_min_clamps_overrides() {
+    // Raising the global minimums must clamp every per-month override up to
+    // the new minimum.
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    state.settings.min_workday_hours = 10;
+    state.settings.min_parallel = 3;
+    state.settings.min_monthly_net_profit = 900;
+    state.clamp_overrides_to_mins();
+    for m in 0..12 {
+        assert!(state.month_overrides.workday[m] >= 10, "month {}", m);
+        assert!(state.month_overrides.parallel[m] >= 3, "month {}", m);
+        assert!(state.month_overrides.net_profit[m] >= 900, "month {}", m);
+    }
+}
+
+#[test]
+fn period_next_prev_wraps() {
+    assert_eq!(Period::FullYear.next(), Period::Month(0));
+    assert_eq!(Period::Month(0).prev(), Period::FullYear);
+    assert_eq!(Period::Month(11).next(), Period::FullYear);
+    assert_eq!(Period::FullYear.prev(), Period::Month(11));
+    assert_eq!(Period::Month(3).next(), Period::Month(4));
+    assert_eq!(Period::Month(3).prev(), Period::Month(2));
+}
+
+#[test]
+fn graph_arrow_marks_selected_month_bars() {
+    use ratatui::backend::TestBackend;
+    let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 1, 1000);
+    // Graph sub-tab + a Month period: the selected month's bars must be
+    // surrounded by a border (box-drawing chars).
+    state.tab = Tab::Graph;
+    state.period = Period::Month(3);
+    state.rebuild_sliders();
+    update_parallel_range(&mut state);
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut state)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+
+    // A downward arrow (▼) must be present in the chart area marking the
+    // selected month's bars.
+    let has_arrow = (0..buf.area.height).any(|y| {
+        (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "\u{25bc}")
+    });
+    assert!(has_arrow, "no arrow drawn above the selected month's bars");
+
+    // And the selected month label (Apr) is highlighted somewhere in the
+    // chart's bottom label row.
+    assert!(
+        (0..buf.area.height).any(|y| find_in_row(&buf, y, "Apr").is_some()),
+        "selected month Apr label not rendered in the chart"
+    );
 }

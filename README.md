@@ -63,6 +63,28 @@ Obtain simulation results (per product and totals) to meet your business goals:
 
 Yearly barchart graph with sales number and (sales amount - profit amount) per month
 
+### Global minimums & monthly overrides
+
+The top-level period tabs select **Full Year** or a single month (Jan..Dec); the
+sidebar changes accordingly:
+
+  * **Full Year** — four *global* sliders:
+    * `min. workday hours` (default 8)
+    * `min. parallel products` (default 1)
+    * `min. monthly net profit` (default 500)
+    * `target yearly net profit` (default 500, a reference shown next to the
+      12 × monthly sum)
+  * **A month** — three *override* sliders: `workday hours`,
+    `parallel products`, and `net profit` for that month. Each override must be
+    **at least** its global minimum and replaces the minimum for that month
+    only.
+
+The monthly net-profit goal used in the `required_sales` formula is therefore
+the per-month value (the override when set, otherwise the global `min. monthly
+net profit`). Workday hours and parallel products are likewise per-month values
+floored by their global minimums. The yearly total is the **sum** of the 12
+monthly results, so the `target yearly net profit` slider is only a reference.
+
 ### Monthly / yearly sales distribution %
 
 Each month's goal is divided between products using percentages. Every month
@@ -122,11 +144,12 @@ Set the interface language with `--lang <code>` (default `en`):
 ### Keys
 
   * `Tab` — move between sidebar and main area
-  * `Shift+Tab` — move between "Products" and "Graph" tabs
+  * `Shift+Tab` — move between "Products" and "Graph" sub-tabs
+  * `[` / `]` — move the top-level period selection left / right
+    (`Full Year`, `Jan`, `Feb`, … `Dec`)
   * `Up`/`Down` — scroll the main area (Products tab) or navigate the sidebar
     sliders
-  * `Left`/`Right` — adjust the focused slider (or change the selected month
-    on the Graph tab's month selector)
+  * `Left`/`Right` — adjust the focused slider
   * `Space` — toggle the lock checkbox of the focused product slider
   * `Control+E` — export the simulation per product and the totals to files
   * `Control+H` — full-screen help on how the simulator works

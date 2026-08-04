@@ -1,12 +1,13 @@
 [package]
 name = "tiny-business-simulator"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2021"
 
 authors = ["David Valin <hola@davidvalin.com>"]
-homepage = "https://github.com/DavidValin/tiny-business-simulator"
+homepage = "https://crates.io/crates/tiny-business-simulator"
 repository = "https://github.com/DavidValin/tiny-business-simulator"
-description = "A simple .txt file business simulator that allows you to setup financial goals and see the targets you will need to meet to achieve your business goal"
+description = "A simple .txt file business simulator that allows you to setup financial goals and see the targets you will need to meet to achieve your business goals"
+keywords = ["business", "simulation", "entrepreneur", "terminal", "simple"]
 license-file = "LICENSE"
 readme = "README.md"
 

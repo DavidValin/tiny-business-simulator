@@ -67,6 +67,7 @@ use crate::simulator::{
 const WORKDAYS_PER_MONTH: f64 = 22.0;
 
 /// Localized month abbreviations for the current language.
+#[allow(dead_code)]
 fn months(lang: &Lang) -> [&'static str; 12] {
     lang.months_abbr()
 }

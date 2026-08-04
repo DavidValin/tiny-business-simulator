@@ -89,7 +89,14 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if a == "--list" {
+        if a == "-h" || a == "--help" {
+            println!(
+                "\ntiny-business-simulator {} - https://crates.io/crates/tiny-business-simulator",
+                env!("CARGO_PKG_VERSION")
+            );
+            println!("by David Valin <hola@davidvalin.com> - www.davidvalin.com\n");
+            std::process::exit(0);
+        } else if a == "--list" {
             list_mode = true;
         } else if a == "--lang" {
             if i + 1 >= args.len() {

@@ -16,6 +16,7 @@ pub struct Currency([u8; 3]);
 impl Currency {
     /// Create a `Currency` from a known-valid 3-letter code at compile time.
     /// Panics at runtime if the code is not 3 uppercase ASCII letters.
+    #[allow(dead_code)]
     pub const fn new(code: &'static str) -> Currency {
         let bytes = code.as_bytes();
         assert!(

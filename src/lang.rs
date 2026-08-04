@@ -1119,13 +1119,15 @@ pub fn fmt(template: &str, args: &[&str]) -> String {
 // Label alignment helpers
 // ---------------------------------------------------------------------------
 
-/// Approximate display width of a string: 1 column per ASCII char, 2 columns
-/// per non-ASCII char. This is correct for CJK and Cyrillic and treats every
-/// emoji as a double-width cell (the convention used by the overwhelming
-/// majority of modern terminals). Accented Latin letters are counted as 2,
-/// which overestimates by 1 per accent — acceptable for label alignment.
+/// Display width of a string according to the Unicode East Asian Width
+/// algorithm (via the `unicode-width` crate). CJK ideographs and emoji are
+/// width 2; ASCII, Cyrillic, and accented Latin are width 1; Ambiguous-width
+/// chars default to 1 (the convention of Western, non-CJK terminals). This is
+/// what makes label and numeric columns line up across all supported
+/// languages (en/es/zh/de/ru/fr) regardless of script.
 pub fn str_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+    use unicode_width::UnicodeWidthStr;
+    s.width()
 }
 
 /// Left-justify `s`, padding with spaces so its display width reaches `width`.
@@ -1265,7 +1267,7 @@ mod tests {
         assert_eq!(str_width("Product:"), 8);
         assert_eq!(str_width("📦 Product:"), 11); // emoji(2) + space(1) + "Product:"(8)
         assert_eq!(str_width("产品"), 4);         // CJK: 2 per char
-        assert_eq!(str_width("Цена"), 8);         // Cyrillic: 2 per char
+        assert_eq!(str_width("Цена"), 4);         // Cyrillic: 1 per char
     }
 
     #[test]
@@ -1317,5 +1319,39 @@ mod tests {
         // Column 0 right-aligned to width 4, column 2 to width 3.
         assert_eq!(out[0], "   5 USD 100");
         assert_eq!(out[1], "1234 USD   5");
+    }
+
+    #[test]
+    fn value_column_aligns_across_all_languages() {
+        // Regression: in de and ru the value column was scattered because
+        // str_width overcounted accented Latin and Cyrillic as width 2.
+        // The invariant: every template's prefix width is strictly less than
+        // label_w (= max prefix width + 2), so pad_to pads each to label_w
+        // and every value starts at the same display column.
+        for lang in [Lang::En, Lang::Es, Lang::Zh, Lang::De, Lang::Ru, Lang::Fr] {
+            let d = lang.dict();
+            let templates = [
+                d.result_product,
+                d.result_sale_price,
+                d.result_total_cost,
+                d.result_net_profit_unit,
+                d.result_profit_margin,
+                d.result_prod_time,
+            ];
+            let label_w = templates
+                .iter()
+                .map(|t| str_width(prefix_before_value(t)))
+                .max()
+                .unwrap_or(0)
+                + 2;
+            for (i, t) in templates.iter().enumerate() {
+                let pw = str_width(prefix_before_value(t));
+                assert!(
+                    pw < label_w,
+                    "lang {:?}: template {} prefix width {} >= label_w {}",
+                    lang.code(), i, pw, label_w
+                );
+            }
+        }
     }
 }

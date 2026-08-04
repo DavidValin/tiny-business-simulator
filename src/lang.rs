@@ -965,7 +965,7 @@ define_dict! {
     tui_label_workdays: ["workdays", "jornadas", "工作日", "Arbeitstage", "раб. дни", "jours trav."],
     tui_label_workday: ["workday", "jornada", "工作日", "Arbeitstag", "раб. день", "jour trav."],
     tui_label_parallel: ["parallel", "paralelo", "并行", "Parallel", "паралл.", "parall."],
-    tui_label_yearly_ref: ["Yearly ref", "Ref. anual", "年度参考", "Jahresref.", "Годовая ссылка", "Réf. annuelle"],
+    tui_label_yearly_ref: ["Yearly ref", "Ref. anual", "年度参考", "Jahresref.", "Годовой ориентир", "Réf. annuelle"],
     tui_label_12x_mo: ["12x mo", "12x mes", "12x 月", "12x Mo", "12x мес", "12x mois"],
     tui_label_goal: ["goal", "meta", "目标", "Ziel", "цель", "objectif"],
     tui_suffix_hours: ["h", "h", "小时", "Std.", "ч", "h"],

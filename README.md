@@ -1,5 +1,5 @@
 
-## Tiny Business Simulator
+# Tiny Business Simulator
 
 ![preview](https://github.com/DavidValin/tiny-business-simulator/raw/master/preview.gif)
 
@@ -13,7 +13,7 @@ Simulate your next business simply by defining a .txt file for each product in w
   - 0.10 USD cleaning costs
 ```
 
-#### Features
+### Features
 
 Simulate by the next business goals:
 
@@ -63,7 +63,7 @@ Obtain simulation results (per product and totals) to meet your business goals:
 
 Yearly barchart graph with sales number and (sales amount - profit amount) per month
 
-##### Monthly / yearly sales distribution %
+### Monthly / yearly sales distribution %
 
 Each month's goal is divided between products using percentages. Every month
 column always sums to exactly 100%.
@@ -80,7 +80,7 @@ The chart draws 12 separate monthly columns, so the mix can vary per month
 (seasonal demand — e.g. beer sells more in summer, hot chocolate in winter).
 The yearly total is the **sum** of the 12 months.
 
-###### Locks
+### Locks
 
 Locks freeze a product's percentage so it is excluded from redistribution.
 
@@ -94,7 +94,7 @@ Locks freeze a product's percentage so it is excluded from redistribution.
 Locked products keep their fixed share of the 100% pie; the remaining
 percentage is split among the unlocked products.
 
-##### Exports & state
+### Exports & state
 
 Pressing `Control+E` exports the simulation to files **and** saves the current
 percentages, locks, and settings:
@@ -108,7 +108,7 @@ percentages, locks, and settings:
 Reopening the app restores the saved distribution.  If products were added or
 removed since the save, each month's percentages are re-normalized to sum to 100.
 
-##### Interface language
+### Interface language
 
 Set the interface language with `--lang <code>` (default `en`):
 
@@ -119,7 +119,7 @@ Set the interface language with `--lang <code>` (default `en`):
   * `ru` — Russian
   * `fr` — French
 
-#### Keys
+### Keys
 
   * `Tab` — move between sidebar and main area
   * `Shift+Tab` — move between "Products" and "Graph" tabs
@@ -132,18 +132,20 @@ Set the interface language with `--lang <code>` (default `en`):
   * `Control+H` — full-screen help on how the simulator works
   * `q` / `Esc` — quit
 
-#### Quickstart
+### Quickstart
+
+Installation:
+
+* via cargo: `cargo install tiny-business-simulator`
+* via git source code: `make build && make install`
+
+Run program:
 
 ```bash
-# Install
-make build
-sudo make install
-
-# Run
-tiny-business-simulator sample_business
+tiny-business-simulator ./sample_business
 ```
 
-#### Define a business with products/services
+### Define a business with products/services
 
 See `./sample_business` folder for a sample business with 10 products.
 

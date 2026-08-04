@@ -12,21 +12,6 @@ fn result_file_path_appends_resultado() {
 }
 
 #[test]
-fn first_number_handles_basic_cases() {
-    assert_eq!(first_number("abc 3.35 USD"), Some(3.35));
-    assert_eq!(first_number("no numbers here"), None);
-    assert_eq!(first_number("100%"), Some(100.0));
-    assert_eq!(first_number("x .5 y"), Some(0.5));
-}
-
-#[test]
-fn number_after_finds_following_number() {
-    assert_eq!(number_after("Required sales: 498", "Required sales:"), Some(498.0));
-    assert_eq!(number_after("Monthly goal: 100.00 USD → Required sales: 30", "Required sales:"), Some(30.0));
-    assert_eq!(number_after("nothing here", "Required sales:"), None);
-}
-
-#[test]
 fn compute_result_sums_costs_and_converts_hours() {
     let product = ProductDefinition {
         name: "X".into(),
@@ -45,134 +30,6 @@ fn compute_result_sums_costs_and_converts_hours() {
     assert!((r.profit_percent - 50.0).abs() < 1e-9);
     assert!((r.duration_minutes - 90.0).abs() < 1e-9);
     assert_eq!(r.currency, Currency::new("USD"));
-}
-
-#[test]
-fn write_then_read_result_summary_roundtrip() {
-    let dir = env::temp_dir().join("parse_sim_test_roundtrip");
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("prod.txt");
-
-    let product = ProductDefinition {
-        name: "Coffee".into(),
-        sale_price: 4.5,
-        sale_currency: Currency::new("USD"),
-        production_time: 5.0,
-        production_time_unit: TimeUnit::Mins,
-        costs: vec![Cost {
-            price: 1.15,
-            currency: Currency::new("USD"),
-            description: "beans".into(),
-        }],
-    };
-    let result = compute_result(&product);
-    // net_profit = 4.5 - 1.15 = 3.35
-    write_result_file(&file, &result, 100.0, 1200.0, 30, 358, 8, 2, &EN).unwrap();
-
-    let summary = get_result_summary(&file, &EN).expect("summary should exist");
-    assert!(summary.contains("3.35 USD"), "summary was: {}", summary);
-    assert!(summary.contains("74.44%"), "summary was: {}", summary);
-    assert!(summary.contains("30 sales (month)"), "summary was: {}", summary);
-    assert!(summary.contains("358 sales (year)"), "summary was: {}", summary);
-
-    // The result file should also record the workday / parallel settings.
-    let written = fs::read_to_string(result_file_path(&file)).unwrap();
-    assert!(
-        written.contains("2 parallel products in 8 workday hours"),
-        "result file missing suffix, was:\n{}",
-        written
-    );
-    assert!(written.contains("🕐 Workday:"), "missing workday line, was:\n{}", written);
-    assert!(written.contains("🧵 Parallel products:"), "missing parallel line, was:\n{}", written);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn write_then_read_result_summary_roundtrip_spanish() {
-    // The same round-trip in Spanish must succeed using Spanish anchors.
-    let dir = env::temp_dir().join("parse_sim_test_roundtrip_es");
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("prod.txt");
-
-    let product = ProductDefinition {
-        name: "Coffee".into(),
-        sale_price: 4.5,
-        sale_currency: Currency::new("USD"),
-        production_time: 5.0,
-        production_time_unit: TimeUnit::Mins,
-        costs: vec![Cost {
-            price: 1.15,
-            currency: Currency::new("USD"),
-            description: "beans".into(),
-        }],
-    };
-    let result = compute_result(&product);
-    write_result_file(&file, &result, 100.0, 1200.0, 30, 358, 8, 2, &Lang::Es).unwrap();
-
-    let summary = get_result_summary(&file, &Lang::Es).expect("summary should exist");
-    assert!(summary.contains("3.35 USD"), "es summary was: {}", summary);
-    assert!(summary.contains("74.44%"), "es summary was: {}", summary);
-    assert!(summary.contains("30 ventas (mes)"), "es summary was: {}", summary);
-    assert!(summary.contains("358 ventas (año)"), "es summary was: {}", summary);
-
-    let written = fs::read_to_string(result_file_path(&file)).unwrap();
-    assert!(written.contains("🕐 Jornada laboral:"), "es missing jornada, was:\n{}", written);
-    assert!(written.contains("🧵 Productos en paralelo:"), "es missing paralelo, was:\n{}", written);
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn get_result_summary_returns_none_when_no_file() {
-    let dir = env::temp_dir().join("parse_sim_test_nosuch");
-    let file = dir.join("does_not_exist.txt");
-    assert_eq!(get_result_summary(&file, &EN), None);
-}
-
-#[test]
-fn write_totals_file_records_aggregate_rows() {
-    let dir = env::temp_dir().join("parse_sim_test_totals");
-    fs::create_dir_all(&dir).unwrap();
-
-    // 177 monthly sales / 2120 annual sales, 1185 / 17640 minutes,
-    // 8 workday hours, 3 parallel products.
-    write_totals_file(&dir, 2, 177, 2120, 1185.0, 17640.0, 8, 3, &EN).unwrap();
-
-    let written = fs::read_to_string(totals_file_path(&dir)).unwrap();
-    assert!(written.contains("Totals (2 products)"), "was:\n{}", written);
-    assert!(written.contains("177"), "was:\n{}", written);
-    assert!(written.contains("1185.00 min"), "was:\n{}", written);
-    assert!(written.contains("2120"), "was:\n{}", written);
-    assert!(written.contains("17640.00 min"), "was:\n{}", written);
-    assert!(written.contains("3 parallel products in 8 workday hours"), "was:\n{}", written);
-    assert!(written.contains("Workday:"), "was:\n{}", written);
-    assert!(written.contains("Parallel products:"), "was:\n{}", written);
-
-    // The totals file ends with `.simulation_results.txt`, so it must be
-    // ignored by collect_txt_files (never treated as a product definition).
-    let collected = collect_txt_files(&dir);
-    assert!(
-        !collected.iter().any(|p| p == &totals_file_path(&dir)),
-        "totals file should not be collected as a product, got {:?}", collected
-    );
-
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn write_totals_file_works_in_spanish() {
-    let dir = env::temp_dir().join("parse_sim_test_totals_es");
-    fs::create_dir_all(&dir).unwrap();
-
-    write_totals_file(&dir, 3, 500, 6000, 900.0, 10800.0, 6, 2, &Lang::Es).unwrap();
-
-    let written = fs::read_to_string(totals_file_path(&dir)).unwrap();
-    assert!(written.contains("Totales (3 productos)"), "was:\n{}", written);
-    assert!(written.contains("Jornada laboral:"), "was:\n{}", written);
-    assert!(written.contains("Productos en paralelo:"), "was:\n{}", written);
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 fn make_result(name: &str, net_profit: f64, duration_minutes: f64, currency: Currency) -> ProductResult {
@@ -460,4 +317,119 @@ fn per_product_and_totals_lines_align_value_column() {
         clock_offsets[0], clock_offsets[1],
         "🕐 column must align across totals rows:\n{}", tot_lines.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// write_result_file_monthly tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_result_file_monthly_in_all_languages() {
+    let dir = env::temp_dir().join("sim_test_monthly_all_langs");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let product = ProductDefinition {
+        name: "Coffee".into(),
+        sale_price: 4.5,
+        sale_currency: Currency::new("USD"),
+        production_time: 5.0,
+        production_time_unit: TimeUnit::Mins,
+        costs: vec![Cost {
+            price: 1.15,
+            currency: Currency::new("USD"),
+            description: "beans".into(),
+        }],
+    };
+    let result = compute_result(&product);
+
+    for lang in [Lang::En, Lang::Es, Lang::Zh, Lang::De, Lang::Ru, Lang::Fr] {
+        let file = dir.join(format!("prod_{}.txt", lang.code()));
+        let goals = [100.0f64; 12];
+        let sales = [10i64; 12];
+        let minutes = [50.0f64; 12];
+        write_result_file_monthly(
+            &file, &result, &goals, &sales, &minutes,
+            1200.0, 120, 600.0, 8, 2, &lang,
+        )
+        .unwrap();
+        let written = fs::read_to_string(result_file_path(&file)).unwrap();
+        // The product name and sale price appear in every language.
+        assert!(written.contains("Coffee"), "{} missing product name", lang.code());
+        assert!(written.contains("4.50"), "{} missing sale price", lang.code());
+        // All 12 localized month abbreviations appear.
+        for m in lang.months_abbr().iter() {
+            assert!(
+                written.contains(m),
+                "{} missing month {}",
+                lang.code(), m
+            );
+        }
+        // The annual row is present.
+        let annual_anchor = match lang {
+            Lang::En => "Annual goal:",
+            Lang::Es => "Meta anual:",
+            Lang::Zh => "年度目标:",
+            Lang::De => "Jahresziel:",
+            Lang::Ru => "Годовая цель:",
+            Lang::Fr => "Objectif annuel :",
+        };
+        assert!(
+            written.contains(annual_anchor),
+            "{} missing annual goal row", lang.code()
+        );
+        // Workday and parallel settings are present.
+        assert!(written.contains("8"), "{} missing workday hours", lang.code());
+        assert!(written.contains("2"), "{} missing parallel", lang.code());
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn write_totals_file_monthly_in_all_languages() {
+    let dir = env::temp_dir().join("sim_test_totals_monthly_all_langs");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let sales = [10i64; 12];
+    let minutes = [50.0f64; 12];
+
+    for lang in [Lang::En, Lang::Es, Lang::Zh, Lang::De, Lang::Ru, Lang::Fr] {
+        let sub = dir.join(lang.code());
+        fs::create_dir_all(&sub).unwrap();
+        write_totals_file_monthly(
+            &sub, 2, &sales, &minutes, 120, 600.0, 8, 2, &lang,
+        )
+        .unwrap();
+        let written = fs::read_to_string(totals_file_path(&sub)).unwrap();
+        // Totals header appears in the localized form.
+        let header_fragment = match lang {
+            Lang::En => "Totals (2 products)",
+            Lang::Es => "Totales (2 productos)",
+            Lang::Zh => "合计（2 个产品）",
+            Lang::De => "Gesamtergebnis (2 Produkte)",
+            Lang::Ru => "Итоги (2 продуктов)",
+            Lang::Fr => "Totaux (2 produits)",
+        };
+        assert!(
+            written.contains(header_fragment),
+            "{} missing totals header, was:\n{}", lang.code(), written
+        );
+        // All 12 month abbreviations appear.
+        for m in lang.months_abbr().iter() {
+            assert!(
+                written.contains(m),
+                "{} missing month {} in totals", lang.code(), m
+            );
+        }
+        // The totals file is excluded by collect_txt_files.
+        let collected = collect_txt_files(&sub);
+        assert!(
+            !collected.iter().any(|p| p == &totals_file_path(&sub)),
+            "{} totals file should not be collected as product", lang.code()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
 }

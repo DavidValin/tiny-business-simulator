@@ -263,9 +263,16 @@ impl AppState {
         !self.month_locked[idx][m] && !self.yearly_locked[idx]
     }
 
-    /// Compute one month's achievable (capacity-capped) sales totals for month
-    /// `m`, using that month's percentage distribution.
-    fn month_totals_for(&self, m: usize) -> MonthTotals {
+    /// Per-product achievable (capacity-capped) sales for month `m`. When the
+    /// required production minutes exceed the monthly capacity, each product's
+    /// sales are scaled down proportionally so the total fits.
+    fn capped_product_sales(&self, m: usize) -> Vec<i64> {
+        self.compute_month(m).capped_sales
+    }
+
+    /// Core computation for one month: required (uncapped) sales per product,
+    /// the capacity scale factor, and the resulting capped sales.
+    fn compute_month(&self, m: usize) -> MonthComputation {
         let monthly_goal = self.slider_value(SliderKind::MonthlyGoal) as f64;
         let workday_hours = self.slider_value(SliderKind::WorkdayHours).max(1) as f64;
         let parallel = self.slider_value(SliderKind::Parallel).max(1) as f64;
@@ -291,16 +298,34 @@ impl AppState {
             1.0
         };
 
+        let capped_sales: Vec<i64> = req_sales
+            .iter()
+            .map(|s| (*s as f64 * scale).floor() as i64)
+            .collect();
+
+        MonthComputation {
+            capped_sales,
+            required_minutes,
+            capacity_minutes,
+        }
+    }
+
+    /// Compute one month's achievable (capacity-capped) sales totals for month
+    /// `m`, using that month's percentage distribution.
+    fn month_totals_for(&self, m: usize) -> MonthTotals {
+        let mc = self.compute_month(m);
+
         let mut total_units = 0i64;
         let mut total_amount = 0.0f64;
         let mut total_profit = 0.0f64;
         let mut total_cost = 0.0f64;
-        for (s, (_, p)) in req_sales.iter().zip(self.products.iter()) {
-            let units = (*s as f64 * scale).floor() as i64;
+        let mut achieved_minutes = 0.0f64;
+        for (units, (_, p)) in mc.capped_sales.iter().zip(self.products.iter()) {
             total_units += units;
-            total_amount += units as f64 * p.price;
-            total_profit += units as f64 * p.net_profit;
-            total_cost += units as f64 * p.total_cost;
+            total_amount += *units as f64 * p.price;
+            total_profit += *units as f64 * p.net_profit;
+            total_cost += *units as f64 * p.total_cost;
+            achieved_minutes += *units as f64 * p.duration_minutes;
         }
 
         MonthTotals {
@@ -308,8 +333,9 @@ impl AppState {
             amount: total_amount,
             profit: total_profit,
             cost: total_cost,
-            required_minutes,
-            capacity_minutes,
+            required_minutes: mc.required_minutes,
+            capacity_minutes: mc.capacity_minutes,
+            achieved_minutes,
         }
     }
 
@@ -327,6 +353,17 @@ struct MonthTotals {
     amount: f64,
     profit: f64,
     cost: f64,
+    required_minutes: f64,
+    capacity_minutes: f64,
+    /// Actual production minutes after capacity capping (sum of
+    /// `capped_units * duration` per product).
+    achieved_minutes: f64,
+}
+
+/// Intermediate per-month computation: the required (uncapped) sales, the
+/// capacity, and the resulting capped sales per product.
+struct MonthComputation {
+    capped_sales: Vec<i64>,
     required_minutes: f64,
     capacity_minutes: f64,
 }
@@ -660,9 +697,9 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
     let buf = frame.buffer_mut();
     let n = state.products.len();
     let yearly_goal = state.slider_value(SliderKind::YearlyGoal) as f64;
-    // Per-month shares; per-product annual sales = sum of the 12 months.
-    let per_month: Vec<Vec<crate::simulator::ProductShare>> =
-        (0..12).map(|m| month_shares(state, m)).collect();
+    // Per-month, per-product capped sales (what the chart and donuts show).
+    let capped_per_month: Vec<Vec<i64>> =
+        (0..12).map(|m| state.capped_product_sales(m)).collect();
     let rule_style = Style::default().fg(Color::DarkGray);
 
     for k in 0..n {
@@ -699,8 +736,10 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
         let top_y = screen_y as u16;
 
         let (_, r) = &state.products[k];
-        // Annual sales for this product = sum of its 12 monthly sales.
-        let annual_sales: i64 = (0..12).map(|m| per_month[m][k].monthly_sales).sum();
+        // Annual achievable (capped) sales for this product = sum of its 12
+        // monthly capped sales — consistent with the chart, not the required
+        // (uncapped) targets shown in the text lines.
+        let annual_sales: i64 = (0..12).map(|m| capped_per_month[m][k]).sum();
 
         // Donut 1: profit margin (net profit / sale price, %).
         let margin_pct = r.profit_percent;
@@ -2188,7 +2227,8 @@ struct PeriodTotals {
 
 /// All totals shown in the sidebar's bottom region (and written to the totals
 /// file on export). `monthly` reflects the currently-selected month; `annual`
-/// is the sum of all 12 months.
+/// is the sum of all 12 months. Both use achievable (capacity-capped) figures
+/// so they agree with the chart.
 struct Totals {
     monthly: PeriodTotals,
     annual: PeriodTotals,
@@ -2202,32 +2242,26 @@ fn compute_totals(state: &AppState) -> Totals {
     let wh = workday_hours as f64;
     let pp = parallel.max(1) as f64;
 
-    // Selected month's totals.
+    // Selected month's achievable (capped) totals — same computation the
+    // chart uses, so the sidebar and chart always agree.
     let sel = state.selected_month;
-    let mshares = month_shares(state, sel);
-    let mut m_sales = 0i64;
-    let mut m_min = 0.0f64;
-    for s in &mshares {
-        m_sales += s.monthly_sales;
-        m_min += s.monthly_minutes;
-    }
-    let m_hours = m_min / 60.0;
+    let mt = state.month_totals_for(sel);
+    let m_hours = mt.achieved_minutes / 60.0;
 
-    // Annual = sum of all 12 months.
+    // Annual = sum of all 12 months' achievable (capped) totals.
     let mut a_sales = 0i64;
     let mut a_min = 0.0f64;
     for m in 0..12 {
-        for s in month_shares(state, m) {
-            a_sales += s.monthly_sales;
-            a_min += s.monthly_minutes;
-        }
+        let mt_m = state.month_totals_for(m);
+        a_sales += mt_m.units;
+        a_min += mt_m.achieved_minutes;
     }
     let a_hours = a_min / 60.0;
 
     Totals {
         monthly: PeriodTotals {
-            sales: m_sales,
-            minutes: m_min,
+            sales: mt.units,
+            minutes: mt.achieved_minutes,
             hours: m_hours,
             workdays: m_hours / (wh * pp),
         },
@@ -2522,12 +2556,20 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
                 let new_sum: i64 = monthly_pct.iter().map(|p| p[m]).sum();
                 let diff = 100 - new_sum;
                 if diff != 0 && n > 0 {
-                    // Apply the rounding drift to the first non-locked product.
+                    // Apply the rounding drift to the first non-locked
+                    // product. If every product is locked (edge case),
+                    // fall back to the first product so the month still
+                    // sums to exactly 100.
+                    let mut applied = false;
                     for i in 0..n {
                         if !month_locked[i][m] && !yearly_locked[i] {
                             monthly_pct[i][m] += diff;
+                            applied = true;
                             break;
                         }
+                    }
+                    if !applied {
+                        monthly_pct[0][m] += diff;
                     }
                 }
             } else if n > 0 {

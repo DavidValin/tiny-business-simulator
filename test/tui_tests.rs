@@ -823,3 +823,143 @@ fn load_state_normalizes_when_product_added() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn load_state_normalizes_when_product_removed() {
+    let dir = std::env::temp_dir().join("tui_state_normalize_removed_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Save state with 3 products (p0=34, p1=33, p2=33 in Jan → sum=100).
+    std::fs::write(dir.join("p0.txt"), "+ stub\n").unwrap();
+    std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
+    std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
+    std::fs::write(
+        dir.join(".simulation_state"),
+        "p0.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         p1.txt 33 33 33 33 33 33 33 33 33 33 33 33 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         p2.txt 33 33 33 33 33 33 33 33 33 33 33 33 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+    )
+    .unwrap();
+
+    // Load with 2 products (p2 was removed since the save).
+    let products = vec![
+        prod("A", 10.0, 5.0, 5.0),
+        prod("B", 10.0, 5.0, 5.0),
+    ];
+    let paths: Vec<(PathBuf, ProductResult)> = products
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| (dir.join(format!("p{}.txt", i)), r))
+        .collect();
+
+    let loaded = load_state(&dir, &paths).expect("state should load");
+    // After normalization the month must sum to 100 even though p2 is gone
+    // (34+33=67 → scaled to 100).
+    let sum: i64 = loaded.monthly_pct.iter().map(|p| p[0]).sum();
+    assert_eq!(sum, 100, "month must sum to 100 after product removal");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn load_state_normalizes_when_all_products_locked() {
+    let dir = std::env::temp_dir().join("tui_state_all_locked_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Save state with 3 products, ALL yearly-locked, with values that cause
+    // rounding drift: 34 + 34 + 34 = 102. After scaling (each becomes
+    // round(34/102*100)=33 → sum 99, diff=+1) the drift fix must apply even
+    // though no non-locked product exists.
+    std::fs::write(dir.join("p0.txt"), "+ stub\n").unwrap();
+    std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
+    std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
+    std::fs::write(
+        dir.join(".simulation_state"),
+        "p0.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 1\n\
+         p1.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 1\n\
+         p2.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 1\n",
+    )
+    .unwrap();
+
+    let products = vec![
+        prod("A", 10.0, 5.0, 5.0),
+        prod("B", 10.0, 5.0, 5.0),
+        prod("C", 10.0, 5.0, 5.0),
+    ];
+    let paths: Vec<(PathBuf, ProductResult)> = products
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| (dir.join(format!("p{}.txt", i)), r))
+        .collect();
+
+    let loaded = load_state(&dir, &paths).expect("state should load");
+    for m in 0..12 {
+        let sum: i64 = loaded.monthly_pct.iter().map(|p| p[m]).sum();
+        assert_eq!(
+            sum, 100,
+            "month {} must sum to 100 even when all products are locked, got {}",
+            m, sum
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn totals_match_capped_chart_values() {
+    // When capacity is exceeded, the Totals sidebar must show the same
+    // achievable (capped) sales as the chart, not the required (uncapped)
+    // figures.
+    let products = vec![prod("A", 10.0, 5.0, 60.0)];
+    let mut state = make_state(products);
+    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+    set_setting(&mut state, SliderKind::WorkdayHours, 1);
+    set_setting(&mut state, SliderKind::Parallel, 1);
+    // Chart: capacity = 1*22*60 = 1320 min, required = 200*60 = 12000 min.
+    // Scale = 1320/12000 = 0.11 -> floor(200*0.11) = 22 units.
+    let mt = state.month_totals_for(state.selected_month);
+    assert_eq!(mt.units, 22);
+    // Totals sidebar must agree with the chart.
+    let t = compute_totals(&state);
+    assert_eq!(
+        t.monthly.sales, 22,
+        "totals must show capped sales (22), not required (200)"
+    );
+    assert!(
+        (t.monthly.minutes - mt.achieved_minutes).abs() < 1e-9,
+        "totals minutes must match chart achieved minutes"
+    );
+}
+
+#[test]
+fn donut_uses_capped_sales() {
+    // The "vs year" donut should use capped (achievable) sales, not required.
+    // With capacity exceeded, the donut should show < 100% of the yearly goal.
+    let products = vec![prod("A", 10.0, 5.0, 60.0)];
+    let mut state = make_state(products);
+    set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+    set_setting(&mut state, SliderKind::YearlyGoal, 12000);
+    set_setting(&mut state, SliderKind::WorkdayHours, 1);
+    set_setting(&mut state, SliderKind::Parallel, 1);
+
+    // Capped annual sales = 22/month * 12 = 264 (not 200*12=2400).
+    let capped_annual: i64 = (0..12).map(|m| state.capped_product_sales(m)[0]).sum();
+    assert_eq!(capped_annual, 264);
+
+    // The yearly profit from capped sales is well below the yearly goal.
+    let yearly_profit = capped_annual as f64 * 5.0; // 1320
+    let of_goal = yearly_profit / 12000.0 * 100.0; // 11%
+    assert!(
+        of_goal < 100.0,
+        "donut should show <100% when capacity is exceeded, got {:.1}%",
+        of_goal
+    );
+
+    // Uncapped would show 200% — verify the capped value differs.
+    let uncapped_annual: i64 = (0..12)
+        .map(|m| month_shares(&state, m)[0].monthly_sales)
+        .sum();
+    assert_ne!(capped_annual, uncapped_annual);
+}

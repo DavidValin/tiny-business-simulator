@@ -6,31 +6,45 @@ use crate::lang::{self, Lang};
 // Data model
 // ---------------------------------------------------------------------------
 
+/// A currency code (e.g. USD, EUR, GBP, JPY).  Stored as 3 ASCII bytes so the
+/// type stays `Copy` and no heap allocation or unsafe transmute is needed.
+/// Any 3-letter uppercase ISO 4217-style code is accepted, covering every
+/// world currency without a hardcoded list.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Currency {
-    USD,
-    EUR,
-    CAD,
-}
+pub struct Currency([u8; 3]);
 
 impl Currency {
+    /// Create a `Currency` from a known-valid 3-letter code at compile time.
+    /// Panics at runtime if the code is not 3 uppercase ASCII letters.
+    pub const fn new(code: &'static str) -> Currency {
+        let bytes = code.as_bytes();
+        assert!(
+            bytes.len() == 3
+                && bytes[0] >= b'A' && bytes[0] <= b'Z'
+                && bytes[1] >= b'A' && bytes[1] <= b'Z'
+                && bytes[2] >= b'A' && bytes[2] <= b'Z'
+        );
+        Currency([bytes[0], bytes[1], bytes[2]])
+    }
+
     fn from_str(s: &str) -> Option<Currency> {
-        match s {
-            "USD" => Some(Currency::USD),
-            "EUR" => Some(Currency::EUR),
-            "CAD" => Some(Currency::CAD),
-            _ => None,
+        // Accept any 3-letter uppercase ASCII code (ISO 4217 format).
+        if s.len() == 3 && s.bytes().all(|b| b.is_ascii_uppercase()) {
+            let bytes = s.as_bytes();
+            Some(Currency([bytes[0], bytes[1], bytes[2]]))
+        } else {
+            None
         }
     }
 }
 
 impl std::fmt::Display for Currency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Currency::USD => write!(f, "USD"),
-            Currency::EUR => write!(f, "EUR"),
-            Currency::CAD => write!(f, "CAD"),
-        }
+        write!(
+            f,
+            "{}{}{}",
+            self.0[0] as char, self.0[1] as char, self.0[2] as char
+        )
     }
 }
 
@@ -319,12 +333,12 @@ mod tests {
         let product = parse_content(content, &EN).expect("should parse");
         assert_eq!(product.name, "Cerveza");
         assert!((product.sale_price - 2.7).abs() < 1e-9);
-        assert_eq!(product.sale_currency, Currency::USD);
+        assert_eq!(product.sale_currency, Currency::new("USD"));
         assert!((product.production_time - 0.2).abs() < 1e-9);
         assert_eq!(product.production_time_unit, TimeUnit::Mins);
         assert_eq!(product.costs.len(), 3);
         assert!((product.costs[0].price - 0.27).abs() < 1e-9);
-        assert_eq!(product.costs[0].currency, Currency::USD);
+        assert_eq!(product.costs[0].currency, Currency::new("USD"));
         assert_eq!(product.costs[0].description, "labor humana");
         assert_eq!(product.costs[2].description, "gasto agua limpieza");
     }
@@ -333,17 +347,17 @@ mod tests {
     fn parses_product_with_usd_and_hours() {
         let content = "+ Widget : 10 USD : 1.5 hours\n  - 3 USD parts\n";
         let product = parse_content(content, &EN).expect("should parse");
-        assert_eq!(product.sale_currency, Currency::USD);
+        assert_eq!(product.sale_currency, Currency::new("USD"));
         assert_eq!(product.production_time_unit, TimeUnit::Hours);
         assert_eq!(product.costs.len(), 1);
-        assert_eq!(product.costs[0].currency, Currency::USD);
+        assert_eq!(product.costs[0].currency, Currency::new("USD"));
     }
 
     #[test]
     fn parses_product_with_cad_and_no_costs() {
         let content = "+ Maple : 5 CAD : 30 mins\n";
         let product = parse_content(content, &EN).expect("should parse");
-        assert_eq!(product.sale_currency, Currency::CAD);
+        assert_eq!(product.sale_currency, Currency::new("CAD"));
         assert!(product.costs.is_empty());
     }
 
@@ -357,16 +371,27 @@ mod tests {
 
     #[test]
     fn rejects_invalid_sale_currency() {
-        let content = valid_content().replace("2.7 USD : 0.2 mins", "2.7 GBP : 0.2 mins");
+        // "1XY" is not a valid ISO 4217 code (lowercase / non-alpha).
+        let content = valid_content().replace("2.7 USD : 0.2 mins", "2.7 1XY : 0.2 mins");
         let errors = parse_errs(&content);
-        assert!(errors.contains("invalid sale currency") && errors.contains("GBP"), "{}", errors);
+        assert!(errors.contains("invalid sale currency") && errors.contains("1XY"), "{}", errors);
     }
 
     #[test]
     fn rejects_invalid_cost_currency() {
-        let content = valid_content().replace("0.27 USD labor", "0.27 GBP labor");
+        let content = valid_content().replace("0.27 USD labor", "0.27 1XY labor");
         let errors = parse_errs(&content);
-        assert!(errors.contains("invalid cost currency") && errors.contains("GBP"), "{}", errors);
+        assert!(errors.contains("invalid cost currency") && errors.contains("1XY"), "{}", errors);
+    }
+
+    #[test]
+    fn accepts_any_iso_4217_currency_code() {
+        // GBP, JPY, MXN are all valid ISO 4217 codes that were previously rejected.
+        let content = "+ Widget : 10 GBP : 1 mins\n  - 3 JPY parts\n  - 2 MXN labor\n";
+        let product = parse_content(content, &EN).expect("should parse");
+        assert_eq!(product.sale_currency.to_string(), "GBP");
+        assert_eq!(product.costs[0].currency.to_string(), "JPY");
+        assert_eq!(product.costs[1].currency.to_string(), "MXN");
     }
 
     #[test]
@@ -475,7 +500,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("cannot read {}: {}", path.display(), e));
         let product = parse_content(&content, &EN).expect("valid_product.txt should parse");
         assert_eq!(product.name, "Beer");
-        assert_eq!(product.sale_currency, Currency::USD);
+        assert_eq!(product.sale_currency, Currency::new("USD"));
         assert!(product.costs.len() >= 2);
     }
 

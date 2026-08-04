@@ -66,6 +66,7 @@ pub struct Dict {
     pub result_prod_time: &'static str,
     pub result_monthly_goal: &'static str,
     pub result_monthly_time: &'static str,
+    pub result_month_row: &'static str,
     pub result_annual_goal: &'static str,
     pub result_annual_time: &'static str,
     pub result_workday: &'static str,
@@ -101,6 +102,7 @@ pub struct Dict {
     pub per_product_annual: &'static str,
     pub totals_header: &'static str,
     pub total_monthly_sales: &'static str,
+    pub total_month_row: &'static str,
     pub total_annual_sales: &'static str,
     pub err_write_result_file_for: &'static str,
     pub err_write_totals_file: &'static str,
@@ -117,6 +119,62 @@ pub struct Dict {
     pub summary_margin: &'static str,
     pub summary_monthly: &'static str,
     pub summary_annual: &'static str,
+
+    // --- tui.rs : tabs, sidebar titles, slider labels ------------------------
+    pub tui_tab_products: &'static str,
+    pub tui_tab_graph: &'static str,
+    pub tui_sidebar_month: &'static str,
+    pub tui_sidebar_settings: &'static str,
+    pub tui_sidebar_totals: &'static str,
+    pub tui_products_yearly: &'static str,
+    pub tui_month_pct_sales: &'static str,
+    pub tui_slider_workday: &'static str,
+    pub tui_slider_parallel: &'static str,
+    pub tui_slider_monthly_goal: &'static str,
+    pub tui_slider_yearly_goal: &'static str,
+    pub tui_slider_month: &'static str,
+    pub tui_parallel_label: &'static str,
+    pub tui_lock_year: &'static str,
+    pub tui_lock_month: &'static str,
+
+    // --- tui.rs : chart legend / stats ---------------------------------------
+    pub tui_yearly_sales: &'static str,
+    pub tui_legend_units: &'static str,
+    pub tui_legend_profit: &'static str,
+    pub tui_legend_cost: &'static str,
+    pub tui_axis_max: &'static str,
+    pub tui_max: &'static str,
+    pub tui_profit: &'static str,
+    pub tui_yearly: &'static str,
+
+    // --- tui.rs : donut captions ---------------------------------------------
+    pub tui_donut_margin: &'static str,
+    pub tui_donut_vs_year: &'static str,
+
+    // --- tui.rs : totals column labels ---------------------------------------
+    pub tui_label_monthly: &'static str,
+    pub tui_label_yearly: &'static str,
+    pub tui_label_settings: &'static str,
+    pub tui_label_sales: &'static str,
+    pub tui_label_min: &'static str,
+    pub tui_label_hours: &'static str,
+    pub tui_label_workdays: &'static str,
+    pub tui_label_workday: &'static str,
+    pub tui_label_parallel: &'static str,
+    pub tui_label_yearly_ref: &'static str,
+    pub tui_label_12x_mo: &'static str,
+    pub tui_label_goal: &'static str,
+    pub tui_suffix_hours: &'static str,
+
+    // --- tui.rs : footer / status / regions ----------------------------------
+    pub tui_region_main: &'static str,
+    pub tui_region_sidebar: &'static str,
+    pub tui_footer: &'static str,
+    pub tui_footer_status: &'static str,
+    pub tui_export_error: &'static str,
+    pub tui_export_error_totals: &'static str,
+    pub tui_exported: &'static str,
+    pub tui_no_products: &'static str,
 }
 
 macro_rules! define_dict {
@@ -364,12 +422,12 @@ define_dict! {
         "prix de vente invalide « {0} »",
     ],
     err_invalid_sale_currency: [
-        "invalid sale currency '{0}': must be one of USD, USD, CAD",
-        "moneda de venta inválida '{0}': debe ser una de USD, USD, CAD",
-        "无效的售出货币 '{0}'：必须是 USD、USD、CAD 之一",
-        "ungültige Verkaufswährung '{0}': muss USD, USD oder CAD sein",
-        "недопустимая валюта продажи '{0}': должна быть USD, USD или CAD",
-        "monnaie de vente invalide « {0} » : doit être USD, USD ou CAD",
+        "invalid sale currency '{0}': must be a 3-letter ISO 4217 code (e.g. USD, EUR, GBP, JPY)",
+        "moneda de venta inválida '{0}': debe ser un código ISO 4217 de 3 letras (ej. USD, EUR, GBP, JPY)",
+        "无效的售出货币 '{0}'：必须是3字母 ISO 4217代码（如 USD、EUR、GBP、JPY）",
+        "ungültige Verkaufswährung '{0}': muss ein 3-buchstabiger ISO-4217-Code sein (z.B. USD, EUR, GBP, JPY)",
+        "недопустимая валюта продажи '{0}': должна быть 3-буквенным кодом ISO 4217 (напр. USD, EUR, GBP, JPY)",
+        "monnaie de vente invalide « {0} » : doit être un code ISO 4217 de 3 lettres (ex. USD, EUR, GBP, JPY)",
     ],
     err_time_section: [
         "production-time section must be '<time> <unit>', found {0} token(s)",
@@ -420,12 +478,12 @@ define_dict! {
         "prix de coût invalide « {0} »",
     ],
     err_invalid_cost_currency: [
-        "invalid cost currency '{0}': must be one of USD, USD, CAD",
-        "moneda de coste inválida '{0}': debe ser una de USD, USD, CAD",
-        "无效的成本货币 '{0}'：必须是 USD、USD、CAD 之一",
-        "ungültige Kostenwährung '{0}': muss USD, USD oder CAD sein",
-        "недопустимая валюта затрат '{0}': должна быть USD, USD или CAD",
-        "monnaie de coût invalide « {0} » : doit être USD, USD ou CAD",
+        "invalid cost currency '{0}': must be a 3-letter ISO 4217 code (e.g. USD, EUR, GBP, JPY)",
+        "moneda de coste inválida '{0}': debe ser un código ISO 4217 de 3 letras (ej. USD, EUR, GBP, JPY)",
+        "无效的成本货币 '{0}'：必须是3字母 ISO 4217代码（如 USD、EUR、GBP、JPY）",
+        "ungültige Kostenwährung '{0}': muss ein 3-buchstabiger ISO-4217-Code sein (z.B. USD, EUR, GBP, JPY)",
+        "недопустимая валюта затрат '{0}': должна быть 3-буквенным кодом ISO 4217 (напр. USD, EUR, GBP, JPY)",
+        "monnaie de coût invalide « {0} » : doit être un code ISO 4217 de 3 lettres (ex. USD, EUR, GBP, JPY)",
     ],
 
     // --- simulator.rs : result file + stats ----------------------------------
@@ -492,6 +550,14 @@ define_dict! {
         "🕐 Gesamtzeit monatlich:\t{0} Minuten ({1} Stunden) ({2} Parallelprodukte in {3} Arbeitstunden) ({4} Arbeitstage)",
         "🕐 Общее время за месяц:\t{0} минут ({1} часов) ({2} параллельных продукта при {3} часах рабочего дня) ({4} рабочих дней)",
         "🕐 Temps mensuel total :\t{0} minutes ({1} heures) ({2} produits parallèles sur {3} heures de travail) ({4} jours de travail)",
+    ],
+    result_month_row: [
+        "{0} {1} → {2} sales  🕐 {3} min ({4} h)",
+        "{0} {1} → {2} ventas  🕐 {3} min ({4} h)",
+        "{0} {1} → {2} 次销售  🕐 {3} 分钟 ({4} 小时)",
+        "{0} {1} → {2} Verkäufe  🕐 {3} Min ({4} Std.)",
+        "{0} {1} → {2} продаж  🕐 {3} мин ({4} ч)",
+        "{0} {1} → {2} ventes  🕐 {3} min ({4} h)",
     ],
     result_annual_goal: [
         "🎯 Annual goal:\t\t\t{0} {1} → Required sales: {2}",
@@ -745,6 +811,14 @@ define_dict! {
         "  📆 Всего продаж за месяц:  {0}  🕐 {1} мин ({2} ч) ({3} параллельных продукта при {4} часах рабочего дня) ({5} рабочих дней)",
         "  📆 Ventes mensuelles totales :  {0}  🕐 {1} min ({2} h) ({3} produits parallèles sur {4} heures de travail) ({5} jours de travail)",
     ],
+    total_month_row: [
+        "{0} sales  🕐 {1} min ({2} h)",
+        "{0} ventas  🕐 {1} min ({2} h)",
+        "{0} 次销售  🕐 {1} 分钟 ({2} 小时)",
+        "{0} Verkäufe  🕐 {1} Min ({2} Std.)",
+        "{0} продаж  🕐 {1} мин ({2} ч)",
+        "{0} ventes  🕐 {1} min ({2} h)",
+    ],
     total_annual_sales: [
         "  📅 Total annual sales:  {0}  🕐 {1} min ({2} h) ({3} parallel products in {4} workday hours) ({5} workdays)",
         "  📅 Ventas anuales totales:  {0}  🕐 {1} min ({2} h) ({3} productos en paralelo en {4} horas de jornada) ({5} jornadas)",
@@ -845,6 +919,76 @@ define_dict! {
         "\t📅 {0} продаж (год) \t🕐 {1} часов (год)",
         "\t📅 {0} ventes (an) \t🕐 {1} heures (an)",
     ],
+
+    // --- tui.rs : tabs, sidebar titles, slider labels ------------------------
+    tui_tab_products: ["Products", "Productos", "产品", "Produkte", "Продукты", "Produits"],
+    tui_tab_graph: ["Graph", "Gráfico", "图表", "Diagramm", "График", "Graphique"],
+    tui_sidebar_month: ["Month", "Mes", "月份", "Monat", "Месяц", "Mois"],
+    tui_sidebar_settings: ["Settings", "Ajustes", "设置", "Einstellungen", "Настройки", "Paramètres"],
+    tui_sidebar_totals: ["Totals", "Totales", "合计", "Gesamt", "Итоги", "Totaux"],
+    tui_products_yearly: ["Products (yearly %)", "Productos (% anual)", "产品（年度%）", "Produkte (jährlich %)", "Продукты (годовой %)", "Produits (% annuel)"],
+    tui_month_pct_sales: ["{0} (% sales)", "{0} (% ventas)", "{0} (销售%)", "{0} (Verkäufe %)", "{0} (продажи %)", "{0} (% ventes)"],
+    tui_slider_workday: ["Workday hours", "Horas de jornada", "工作日小时", "Arbeitsstunden", "Часы рабочего дня", "Heures de travail"],
+    tui_slider_parallel: ["Parallel products", "Productos en paralelo", "并行产品", "Parallelprodukte", "Параллельные продукты", "Produits parallèles"],
+    tui_slider_monthly_goal: ["Monthly net-profit goal", "Meta mensual de beneficio neto", "月度净利润目标", "Monatliches Nettogewinnziel", "Месячная цель по чистой прибыли", "Objectif mensuel de profit net"],
+    tui_slider_yearly_goal: ["Yearly net-profit goal", "Meta anual de beneficio neto", "年度净利润目标", "Jährliches Nettogewinnziel", "Годовая цель по чистой прибыли", "Objectif annuel de profit net"],
+    tui_slider_month: ["Month", "Mes", "月份", "Monat", "Месяц", "Mois"],
+    tui_parallel_label: ["Parallel products [{0}..={1}]", "Productos en paralelo [{0}..={1}]", "并行产品 [{0}..={1}]", "Parallelprodukte [{0}..={1}]", "Параллельные продукты [{0}..={1}]", "Produits parallèles [{0}..={1}]"],
+    tui_lock_year: [" lock year", " bloquear año", " 锁定年度", " Jahr sperren", " блок. год", " verrouiller année"],
+    tui_lock_month: [" lock month", " bloquear mes", " 锁定月份", " Monat sperren", " блок. месяц", " verrouiller mois"],
+
+    // --- tui.rs : chart legend / stats ---------------------------------------
+    tui_yearly_sales: ["Yearly sales", "Ventas anuales", "年度销售", "Jährliche Verkäufe", "Годовые продажи", "Ventes annuelles"],
+    tui_legend_units: ["\u{25a0} units (n)   ", "\u{25a0} unidades (n)   ", "\u{25a0} 单位 (n)   ", "\u{25a0} Einheiten (n)   ", "\u{25a0} единиц (n)   ", "\u{25a0} unités (n)   "],
+    tui_legend_profit: ["\u{25a0} profit ($)   ", "\u{25a0} beneficio ($)   ", "\u{25a0} 利润 ($)   ", "\u{25a0} Gewinn ($)   ", "\u{25a0} прибыль ($)   ", "\u{25a0} profit ($)   "],
+    tui_legend_cost: ["\u{25a0} cost ($)   ", "\u{25a0} coste ($)   ", "\u{25a0} 成本 ($)   ", "\u{25a0} Kosten ($)   ", "\u{25a0} затраты ($)   ", "\u{25a0} coût ($)   "],
+    tui_axis_max: ["axis max", "máx. eje", "轴最大值", "Achsenmax", "макс. оси", "max. axe"],
+    tui_max: ["max", "máx", "最大", "Max", "макс", "max"],
+    tui_profit: ["profit", "beneficio", "利润", "Gewinn", "прибыль", "profit"],
+    tui_yearly: ["yearly", "anual", "年度", "jährlich", "годовой", "annuel"],
+
+    // --- tui.rs : donut captions ---------------------------------------------
+    tui_donut_margin: ["margin", "margen", "利润率", "Marge", "маржа", "marge"],
+    tui_donut_vs_year: ["vs year", "vs año", "vs 年度", "vs Jahr", "vs год", "vs an"],
+
+    // --- tui.rs : totals column labels ---------------------------------------
+    tui_label_monthly: ["Monthly", "Mensual", "月度", "Monatlich", "Ежемесячно", "Mensuel"],
+    tui_label_yearly: ["Yearly", "Anual", "年度", "Jährlich", "Ежегодно", "Annuel"],
+    tui_label_settings: ["Settings", "Ajustes", "设置", "Einstellungen", "Настройки", "Paramètres"],
+    tui_label_sales: ["sales", "ventas", "销售", "Verkäufe", "продажи", "ventes"],
+    tui_label_min: ["min", "min", "分钟", "Min", "мин", "min"],
+    tui_label_hours: ["hours", "horas", "小时", "Std.", "часы", "heures"],
+    tui_label_workdays: ["workdays", "jornadas", "工作日", "Arbeitstage", "раб. дни", "jours trav."],
+    tui_label_workday: ["workday", "jornada", "工作日", "Arbeitstag", "раб. день", "jour trav."],
+    tui_label_parallel: ["parallel", "paralelo", "并行", "Parallel", "паралл.", "parall."],
+    tui_label_yearly_ref: ["Yearly ref", "Ref. anual", "年度参考", "Jahresref.", "Годовая ссылка", "Réf. annuelle"],
+    tui_label_12x_mo: ["12x mo", "12x mes", "12x 月", "12x Mo", "12x мес", "12x mois"],
+    tui_label_goal: ["goal", "meta", "目标", "Ziel", "цель", "objectif"],
+    tui_suffix_hours: ["h", "h", "小时", "Std.", "ч", "h"],
+
+    // --- tui.rs : footer / status / regions ----------------------------------
+    tui_region_main: ["main", "principal", "主区域", "Hauptbereich", "основная", "principal"],
+    tui_region_sidebar: ["sidebar", "lateral", "侧栏", "Seitenleiste", "боковая", "latéral"],
+    tui_footer: [
+        "region: {0}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Space lock   Ctrl+E export   q quit",
+        "región: {0}   Tab región   Shift+Tab pestaña   \u{2191}/\u{2193} desplazar/navegar   \u{2190}/\u{2192} ajustar   Espacio bloquear   Ctrl+E exportar   q salir",
+        "区域: {0}   Tab 区域   Shift+Tab 标签   \u{2191}/\u{2193} 滚动/导航   \u{2190}/\u{2192} 调整   空格 锁定   Ctrl+E 导出   q 退出",
+        "Bereich: {0}   Tab Bereich   Shift+Tab Tab   \u{2191}/\u{2193} scrollen/navigieren   \u{2190}/\u{2192} anpassen   Leertaste sperren   Ctrl+E Export   q Beenden",
+        "регион: {0}   Tab регион   Shift+Tab вкладка   \u{2191}/\u{2193} прокрутка/навигация   \u{2190}/\u{2192} настроить   Пробел блок.   Ctrl+E экспорт   q выход",
+        "région : {0}   Tab région   Shift+Tab onglet   \u{2191}/\u{2193} défiler/naviguer   \u{2190}/\u{2192} ajuster   Espace verrouiller   Ctrl+E exporter   q quitter",
+    ],
+    tui_footer_status: [
+        "{0}   |   region: {1}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Space lock   Ctrl+E export   q quit",
+        "{0}   |   región: {1}   Tab región   Shift+Tab pestaña   \u{2191}/\u{2193} desplazar/navegar   \u{2190}/\u{2192} ajustar   Espacio bloquear   Ctrl+E exportar   q salir",
+        "{0}   |   区域: {1}   Tab 区域   Shift+Tab 标签   \u{2191}/\u{2193} 滚动/导航   \u{2190}/\u{2192} 调整   空格 锁定   Ctrl+E 导出   q 退出",
+        "{0}   |   Bereich: {1}   Tab Bereich   Shift+Tab Tab   \u{2191}/\u{2193} scrollen/navigieren   \u{2190}/\u{2192} anpassen   Leertaste sperren   Ctrl+E Export   q Beenden",
+        "{0}   |   регион: {1}   Tab регион   Shift+Tab вкладка   \u{2191}/\u{2193} прокрутка/навигация   \u{2190}/\u{2192} настроить   Пробел блок.   Ctrl+E экспорт   q выход",
+        "{0}   |   région : {1}   Tab région   Shift+Tab onglet   \u{2191}/\u{2193} défiler/naviguer   \u{2190}/\u{2192} ajuster   Espace verrouiller   Ctrl+E exporter   q quitter",
+    ],
+    tui_export_error: ["export error ({0}): {1}", "error de exportación ({0}): {1}", "导出错误 ({0}): {1}", "Exportfehler ({0}): {1}", "ошибка экспорта ({0}): {1}", "erreur d'export ({0}) : {1}"],
+    tui_export_error_totals: ["export error (totals): {0}", "error de exportación (totales): {0}", "导出错误 (合计): {0}", "Exportfehler (Gesamt): {0}", "ошибка экспорта (итоги): {0}", "erreur d'export (totaux) : {0}"],
+    tui_exported: ["exported {0} product files + totals to {1}", "exportados {0} archivos de producto + totales a {1}", "已导出 {0} 个产品文件及合计到 {1}", "{0} Produkdateien + Gesamt exportiert nach {1}", "экспортировано {0} файлов продуктов + итоги в {1}", "exporté {0} fichiers produit + totaux vers {1}"],
+    tui_no_products: ["No products with a positive net profit were found in {0}", "No se encontraron productos con beneficio neto positivo en {0}", "在 {0} 中未找到具有正净利润的产品", "Keine Produkte mit positivem Nettogewinn in {0} gefunden", "В {0} не найдено продуктов с положительной чистой прибылью", "Aucun produit avec un profit net positif trouvé dans {0}"],
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +1044,18 @@ impl Lang {
             Lang::De => &DE,
             Lang::Ru => &RU,
             Lang::Fr => &FR,
+        }
+    }
+
+    /// Localized month abbreviations (12 entries, Jan..Dec).
+    pub fn months_abbr(&self) -> [&'static str; 12] {
+        match self {
+            Lang::En => ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"],
+            Lang::Es => ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"],
+            Lang::Zh => ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"],
+            Lang::De => ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"],
+            Lang::Ru => ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"],
+            Lang::Fr => ["janv", "févr", "mars", "avr", "mai", "juin", "juil", "août", "sept", "oct", "nov", "déc"],
         }
     }
 }
@@ -990,6 +1146,14 @@ pub fn fmt_aligned(template: &str, args: &[&str], label_width: usize) -> String 
     let prefix = template[..idx].trim_end();
     let rest = &template[idx..];
     format!("{}{}", pad_to(prefix, label_width), fmt(rest, args))
+}
+
+/// Like [`fmt_aligned`] but with a caller-supplied prefix string (padded to
+/// `label_width`) instead of extracting the prefix from the template. Used for
+/// month rows where the prefix includes a dynamic month abbreviation that must
+/// appear right next to the emoji, not pushed right by the label-width padding.
+pub fn fmt_prefixed(template: &str, prefix: &str, args: &[&str], label_width: usize) -> String {
+    format!("{}{}", pad_to(prefix, label_width), fmt(template, args))
 }
 
 /// Right-justify `s`, padding on the left with spaces so its display width

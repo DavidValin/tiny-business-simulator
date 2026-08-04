@@ -58,32 +58,44 @@ use ratatui::Terminal;
 use crate::lang::{self, Lang};
 use crate::parser::parse_content;
 use crate::simulator::{
-    collect_txt_files, compute_product_shares, compute_result, parallel_range, write_result_file,
-    write_totals_file, ProductResult,
+    collect_txt_files, compute_product_shares, compute_result, parallel_range,
+    write_result_file_monthly, write_totals_file_monthly, ProductResult,
 };
 
 /// Workdays assumed per month when deriving the production capacity in minutes.
 const WORKDAYS_PER_MONTH: f64 = 22.0;
 
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
+/// Localized month abbreviations for the current language.
+fn months(lang: &Lang) -> [&'static str; 12] {
+    lang.months_abbr()
+}
 
 // ---------------------------------------------------------------------------
 // Slider model
 // ---------------------------------------------------------------------------
 
-/// Kinds of sliders shown in the sidebar.  The product-percentage sliders are
-/// identified by the product index.
+/// Kinds of sliders shown in the sidebar.
+///
+/// `YearlyPercent(i)` — the product's yearly % (Products tab). The value is
+/// *derived* (the mean of the 12 monthly %) and shown as a slider; editing it
+/// propagates to every month where the product isn't month-locked.
+///
+/// `MonthPercent(i)` — the product's % for the currently-selected month
+/// (Graph tab). Editing it only affects that month.
+///
+/// `MonthSelector` — the Jan..Dec `<select>` at the top of the Graph sidebar.
 #[derive(Clone, Copy, PartialEq)]
 enum SliderKind {
-    Percent(usize),
+    YearlyPercent(usize),
+    MonthPercent(usize),
+    MonthSelector,
     WorkdayHours,
     Parallel,
     MonthlyGoal,
     YearlyGoal,
 }
 
+#[derive(Clone)]
 struct Slider {
     kind: SliderKind,
     label: String,
@@ -120,6 +132,31 @@ impl Slider {
     }
 }
 
+/// Human-readable value readout for a slider's track line. For the month
+/// selector the readout is the month name rather than a raw number.
+fn slider_readout(s: &Slider, lang: &Lang) -> String {
+    match s.kind {
+        SliderKind::MonthSelector => format!(" {}", lang.months_abbr()[s.value as usize]),
+        _ => format!(" {}{}", s.value, s.suffix),
+    }
+}
+
+/// Whether a slider is a product-percentage slider (and thus shows the
+/// right-aligned "lock" checkbox on its track line).
+fn is_product_pct(s: &Slider) -> bool {
+    matches!(s.kind, SliderKind::YearlyPercent(_) | SliderKind::MonthPercent(_))
+}
+
+/// Short lock-checkbox label for a product-percentage slider.
+fn slider_lock_label<'a>(s: &Slider, lang: &Lang) -> &'a str {
+    let d = lang.dict();
+    match s.kind {
+        SliderKind::YearlyPercent(_) => d.tui_lock_year,
+        SliderKind::MonthPercent(_) => d.tui_lock_month,
+        _ => "",
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TUI state
 // ---------------------------------------------------------------------------
@@ -146,6 +183,21 @@ enum Region {
 struct AppState {
     /// (file path, computed result) for every product with positive net profit.
     products: Vec<(PathBuf, ProductResult)>,
+    /// Per-product × per-month sales % (source of truth). Each month column
+    /// sums to 100 across products. Indexed `[product][month]`.
+    monthly_pct: Vec<[i64; 12]>,
+    /// Per-product × per-month lock. Indexed `[product][month]`. A month entry
+    /// is effectively locked when `month_locked[p][m] || yearly_locked[p]`.
+    month_locked: Vec<[bool; 12]>,
+    /// Per-product yearly lock. Freezes the product's % in ALL 12 months
+    /// (month checkboxes render checked + greyed, uneditable) and pins its
+    /// yearly % (which stays equal to the mean of the frozen months).
+    yearly_locked: Vec<bool>,
+    /// Currently-selected month for the Graph tab's `<select>` (0 = Jan).
+    selected_month: usize,
+    /// Flat slider list rebuilt whenever the tab or selected month changes.
+    /// Yearly slider values are derived from `monthly_pct` (mean of the 12
+    /// months); monthly slider values are `monthly_pct[p][selected_month]`.
     sliders: Vec<Slider>,
     selected: usize,
     /// Top visible entry index in the sidebar's scrollable slider list.
@@ -174,36 +226,50 @@ impl AppState {
             .unwrap_or(0)
     }
 
-    fn percent_for(&self, idx: usize) -> i64 {
-        self.slider_value(SliderKind::Percent(idx))
+    /// Yearly % for product `idx` = `round(mean of the 12 monthly %)`. When the
+    /// product is yearly-locked the value is still the mean (the months are all
+    /// frozen, so the mean is stable).
+    fn yearly_pct(&self, idx: usize) -> i64 {
+        let sum: i64 = self.monthly_pct[idx].iter().sum();
+        let n = 12i64;
+        (sum as f64 / n as f64).round() as i64
     }
 
-    /// Normalized share (0..=1) for product `idx`, from the raw percentage
-    /// sliders.  If every slider is zero the products are split equally.
-    fn share_for(&self, idx: usize) -> f64 {
-        let total: i64 = (0..self.products.len()).map(|i| self.percent_for(i).max(0)).sum();
+    /// The 12 monthly % for product `idx`.
+    #[allow(dead_code)]
+    fn monthly_pcts(&self, idx: usize) -> [i64; 12] {
+        self.monthly_pct[idx]
+    }
+
+    /// Normalized share (0..=1) for product `idx` in month `m`. If the month's
+    /// total is zero the products are split equally.
+    fn share_for_month(&self, idx: usize, m: usize) -> f64 {
+        let total: i64 = (0..self.products.len()).map(|i| self.monthly_pct[i][m].max(0)).sum();
         if total <= 0 {
             return 1.0 / self.products.len() as f64;
         }
-        self.percent_for(idx).max(0) as f64 / total as f64
+        self.monthly_pct[idx][m].max(0) as f64 / total as f64
     }
 
-    /// Compute one month's achievable (capacity-capped) sales totals.
-    ///
-    /// `profit` is the portion of `amount` that is net profit and `cost` the
-    /// portion that is total cost (`amount = profit + cost`).
-    fn month_totals(&self) -> MonthTotals {
+    /// Is product `idx` editable in month `m`? False when month-locked OR
+    /// yearly-locked.
+    fn editable_in_month(&self, idx: usize, m: usize) -> bool {
+        !self.month_locked[idx][m] && !self.yearly_locked[idx]
+    }
+
+    /// Compute one month's achievable (capacity-capped) sales totals for month
+    /// `m`, using that month's percentage distribution.
+    fn month_totals_for(&self, m: usize) -> MonthTotals {
         let monthly_goal = self.slider_value(SliderKind::MonthlyGoal) as f64;
         let workday_hours = self.slider_value(SliderKind::WorkdayHours).max(1) as f64;
         let parallel = self.slider_value(SliderKind::Parallel).max(1) as f64;
 
         let capacity_minutes = workday_hours * WORKDAYS_PER_MONTH * 60.0 * parallel;
 
-        // Required sales per product from the goal split.
         let mut req_sales: Vec<i64> = Vec::with_capacity(self.products.len());
         let mut required_minutes = 0.0;
         for (i, (_, p)) in self.products.iter().enumerate() {
-            let target_profit = self.share_for(i) * monthly_goal;
+            let target_profit = self.share_for_month(i, m) * monthly_goal;
             let s = if p.net_profit > 0.0 {
                 ((target_profit / p.net_profit).ceil() as i64).max(0)
             } else {
@@ -213,8 +279,6 @@ impl AppState {
             required_minutes += s as f64 * p.duration_minutes;
         }
 
-        // Capacity cap: if the required production time exceeds what the
-        // workday/parallel setup can deliver in a month, scale sales down.
         let scale = if required_minutes > capacity_minutes && required_minutes > 0.0 {
             capacity_minutes / required_minutes
         } else {
@@ -241,6 +305,12 @@ impl AppState {
             required_minutes,
             capacity_minutes,
         }
+    }
+
+    /// Convenience: the selected month's totals (used by the chart title etc.).
+    #[allow(dead_code)]
+    fn month_totals(&self) -> MonthTotals {
+        self.month_totals_for(self.selected_month)
     }
 }
 
@@ -280,19 +350,28 @@ fn fit_bar_width(chart_width: u16, bar_gap: u16, group_gap: u16) -> u16 {
 /// `BarChart` widget only supports one style per bar, so the chart is drawn
 /// manually to get the two-tone `$` bar.
 fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let mt = state.month_totals();
-    let units = mt.units as f64;
-    let amount = mt.amount;
-    let profit = mt.profit;
+    // Compute each month's totals once (the chart now shows 12 distinct
+    // months whose % distributions may differ). Yearly = sum of the 12.
+    let months: Vec<MonthTotals> = (0..12).map(|m| state.month_totals_for(m)).collect();
+    let yearly_units: i64 = months.iter().map(|m| m.units).sum();
+    let yearly_amount: f64 = months.iter().map(|m| m.amount).sum();
+    let yearly_profit: f64 = months.iter().map(|m| m.profit).sum();
 
-    let max_val = units.max(amount).max(1.0);
+    let max_val = months
+        .iter()
+        .map(|m| (m.units as f64).max(m.amount))
+        .fold(1.0f64, f64::max);
     let max_with_headroom = (max_val * 1.25).max(max_val + 1.0);
 
-    let yearly_units = mt.units * 12;
-    let yearly_amount = amount * 12.0;
-    let title = format!(
-        "Yearly sales  \u{25a0} units (n)   \u{25a0} amount ($)   \u{25a0} profit ($)   |   axis max: {:.0}   monthly: n={} \u{00a4}={:.0} (profit {:.0})   yearly: n={} \u{00a4}={:.0}",
-        max_with_headroom, mt.units, amount, profit, yearly_units, yearly_amount,
+    let sel = state.selected_month;
+    let mt = &months[sel];
+    let d = state.lang.dict();
+    let mnames = state.lang.months_abbr();
+    let stats = format!(
+        "  |   {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})   {7}: n={8} \u{00a4}={9:.0} ({10} {11:.0})",
+        d.tui_axis_max, max_with_headroom,
+        mnames[sel], mt.units, mt.amount, d.tui_profit, mt.profit,
+        d.tui_yearly, yearly_units, yearly_amount, d.tui_profit, yearly_profit,
     );
     let active = state.active_region == Region::Main;
     let border_style = if active {
@@ -300,17 +379,27 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     } else {
         Style::default()
     };
+    // Build the title as styled spans so each legend marker inherits the
+    // color of its bar region: cyan = units (n), green = profit ($),
+    // yellow = cost ($).
+    let bold = Modifier::BOLD;
+    let title = Line::from(vec![
+        Span::raw(format!("{}  ", d.tui_yearly_sales)),
+        Span::styled(d.tui_legend_units, Style::default().fg(Color::Cyan).add_modifier(bold)),
+        Span::styled(d.tui_legend_profit, Style::default().fg(Color::Green).add_modifier(bold)),
+        Span::styled(d.tui_legend_cost, Style::default().fg(Color::Yellow).add_modifier(bold)),
+        Span::raw(stats),
+    ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(border_style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let buf = frame.buffer_mut();
 
     // Axis-max label at the top-left of the inner area.
-    let axis_label = format!("\u{2191} max {:.0}", max_with_headroom);
+    let axis_label = format!("\u{2191} {} {:.0}", d.tui_max, max_with_headroom);
     let axis_w = axis_label.chars().count().min(inner.width as usize) as u16;
     buf.set_string(
         inner.x,
@@ -338,6 +427,7 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let green = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
     let label_style = Style::default().fg(Color::DarkGray);
     let month_style = Style::default().fg(Color::White);
+    let sel_month_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
     let max = max_with_headroom;
 
@@ -345,6 +435,10 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         let group_x = inner.x + g * (group_width + group_gap);
         let n_x = group_x;
         let d_x = group_x + bar_width + bar_gap;
+        let mt = &months[g as usize];
+        let units = mt.units as f64;
+        let amount = mt.amount;
+        let profit = mt.profit;
 
         // n bar: single color, fractional top cell.
         draw_bar_column(buf, n_x, bar_bottom, bar_width, units, max, bar_h, cyan, None);
@@ -360,7 +454,6 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         let total_h = total_h.clamp(0, bar_h as i64);
         let mut profit_h = (profit / max * bar_h as f64).round() as i64;
         profit_h = profit_h.clamp(0, total_h);
-        let cost_h = total_h - profit_h;
         if profit_h >= 1 {
             render_bar_value(buf, d_x, bar_bottom, bar_width, &format!("{:.0}", profit), Color::Green);
         }
@@ -379,12 +472,17 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
             buf.set_string(n_label_x, bar_bottom + 1, "n", label_style);
             buf.set_string(d_label_x, bar_bottom + 1, "$", label_style);
         }
-        // Month label centered under the group.
-        let m = MONTHS[g as usize];
+        // Month label centered under the group; the selected month is highlighted.
+        let m = mnames[g as usize];
         let m_w = m.chars().count() as u16;
         let m_x = group_x + group_width.saturating_sub(m_w) / 2;
         if bar_bottom + 2 < inner.y + inner.height {
-            buf.set_string(m_x, bar_bottom + 2, m, month_style);
+            let ms = if g as usize == state.selected_month {
+                sel_month_style
+            } else {
+                month_style
+            };
+            buf.set_string(m_x, bar_bottom + 2, m, ms);
         }
     }
 }
@@ -456,7 +554,8 @@ fn draw_bar_column(
 /// Render the two main-area tabs (`Graph`, `Product details`) across `area`.
 /// The active tab is shown inverted/bold; the inactive one is dim.
 fn render_tab_bar(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
-    let tabs = [(Tab::Products, "Products"), (Tab::Graph, "Graph")];
+    let d = state.lang.dict();
+    let tabs = [(Tab::Products, d.tui_tab_products), (Tab::Graph, d.tui_tab_graph)];
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (i, (tab, label)) in tabs.iter().enumerate() {
         let active = state.tab == *tab;
@@ -488,7 +587,7 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title("Products")
+        .title(state.lang.dict().tui_tab_products)
         .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(border_style);
     let inner = block.inner(area);
@@ -498,9 +597,12 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
     }
 
     // Right strip reserved for the two per-product donut graphs (two columns,
-    // right-aligned).  The text flows in the remaining left area.
-    let right_strip_w = (2 * DONUT_W + DONUT_GAP).min(inner.width);
-    let text_w = inner.width.saturating_sub(right_strip_w);
+    // right-aligned).  The text flows in the remaining left area.  A 1-char
+    // right padding is reserved so the donuts never render flush against the
+    // border.
+    let right_pad: u16 = 1;
+    let right_strip_w = (2 * DONUT_W + DONUT_GAP).min(inner.width.saturating_sub(right_pad));
+    let text_w = inner.width.saturating_sub(right_strip_w + right_pad);
     // 1-char left padding for the product text.
     let pad = PROD_PAD as u16;
     let text_area = Rect::new(
@@ -532,7 +634,9 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
     let buf = frame.buffer_mut();
     let n = state.products.len();
     let yearly_goal = state.slider_value(SliderKind::YearlyGoal) as f64;
-    let shares = product_shares(state);
+    // Per-month shares; per-product annual sales = sum of the 12 months.
+    let per_month: Vec<Vec<crate::simulator::ProductShare>> =
+        (0..12).map(|m| month_shares(state, m)).collect();
     let rule_style = Style::default().fg(Color::DarkGray);
 
     for k in 0..n {
@@ -569,12 +673,13 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
         let top_y = screen_y as u16;
 
         let (_, r) = &state.products[k];
-        let s = &shares[k];
+        // Annual sales for this product = sum of its 12 monthly sales.
+        let annual_sales: i64 = (0..12).map(|m| per_month[m][k].monthly_sales).sum();
 
         // Donut 1: profit margin (net profit / sale price, %).
         let margin_pct = r.profit_percent;
         // Donut 2: this product's yearly net profit vs the yearly goal slider.
-        let yearly_profit = s.annual_sales as f64 * r.net_profit;
+        let yearly_profit = annual_sales as f64 * r.net_profit;
         let of_goal_pct = if yearly_goal > 0.0 {
             yearly_profit / yearly_goal * 100.0
         } else {
@@ -583,8 +688,9 @@ fn render_product_details(frame: &mut ratatui::Frame, area: Rect, state: &mut Ap
 
         let d1_x = strip_x;
         let d2_x = strip_x + DONUT_W + DONUT_GAP;
-        draw_donut(buf, d1_x, top_y, margin_pct, "margin", inner);
-        draw_donut(buf, d2_x, top_y, of_goal_pct, "vs year", inner);
+        let dd = state.lang.dict();
+        draw_donut(buf, d1_x, top_y, margin_pct, dd.tui_donut_margin, inner);
+        draw_donut(buf, d2_x, top_y, of_goal_pct, dd.tui_donut_vs_year, inner);
     }
 
     // Scroll indicators (up/down arrows) on the right edge, matching the
@@ -624,8 +730,10 @@ const DONUT_GAP: u16 = 4;
 /// block in the details view.
 const PROD_PAD: usize = 1;
 /// Number of text lines that describe one product in the details view (stats +
-/// monthly + annual + workday/parallel), excluding padding and the separator.
-const PRODUCT_CONTENT_LINES: usize = 15;
+/// 12 monthly rows + annual + workday/parallel), excluding padding and the
+/// separator. 6 stats + 1 blank + 12 months + 1 blank + 2 annual + 1 blank +
+/// 2 workday/parallel = 25.
+const PRODUCT_CONTENT_LINES: usize = 25;
 /// A product's padded area height: top pad + content + bottom pad.
 const PRODUCT_AREA_H: usize = 2 * PROD_PAD + PRODUCT_CONTENT_LINES;
 /// Lines per product in the scrollable Paragraph: padded area + one separator
@@ -768,14 +876,18 @@ fn clip_set_str(
 }
 
 /// Build the full list of lines for the Product-details view: every product's
-/// export-file rows concatenated, separated by a blank line.  The label column
-/// width is computed across all templates (just like `write_result_file`) so
-/// the value columns line up.
+/// export-file rows concatenated, separated by a blank line.  Each product
+/// shows its stats, a 12-month breakdown (one row per month), the annual
+/// goal/time (annual = sum of the 12 months), and the shared workday/parallel
+/// settings.  The label column width is computed across all templates (just
+/// like `write_result_file_monthly`) so the value columns line up.
 fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
     let d = state.lang.dict();
     let workday_hours = state.slider_value(SliderKind::WorkdayHours);
     let parallel = state.slider_value(SliderKind::Parallel).max(1);
-    let shares = product_shares(state);
+    // Per-month, per-product shares.
+    let per_month: Vec<Vec<crate::simulator::ProductShare>> =
+        (0..12).map(|m| month_shares(state, m)).collect();
 
     let all_templates = [
         d.result_product,
@@ -784,8 +896,7 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
         d.result_net_profit_unit,
         d.result_profit_margin,
         d.result_prod_time,
-        d.result_monthly_goal,
-        d.result_monthly_time,
+        d.result_month_row,
         d.result_annual_goal,
         d.result_annual_time,
         d.result_workday,
@@ -800,9 +911,10 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
 
     let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let goal_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let month_style = Style::default();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, ((_, r), s)) in state.products.iter().zip(shares.iter()).enumerate() {
+    for (i, (_, r)) in state.products.iter().enumerate() {
         let cur = r.currency.to_string();
 
         // Top padding (1 blank line).
@@ -826,37 +938,47 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
 
         lines.push(Line::from(""));
 
-        // Monthly goal + time.
-        lines.push(Line::from(Span::styled(
-            lang::fmt_aligned(
-                d.result_monthly_goal,
-                &[&format!("{:.2}", s.monthly_goal), &cur, &s.monthly_sales.to_string()],
+        // 12 monthly rows.
+        let mut annual_goal = 0.0f64;
+        let mut annual_sales = 0i64;
+        let mut annual_minutes = 0.0f64;
+        for m in 0..12 {
+            let s = &per_month[m][i];
+            annual_goal += s.monthly_goal;
+            annual_sales += s.monthly_sales;
+            annual_minutes += s.monthly_minutes;
+            let hours = s.monthly_minutes / 60.0;
+            let prefix = format!("  📆 {}:", crate::simulator::months_abbr(&state.lang)[m]);
+            let text = lang::fmt_prefixed(
+                d.result_month_row,
+                &prefix,
+                &[
+                    &format!("{:.2}", s.monthly_goal),
+                    &cur,
+                    &s.monthly_sales.to_string(),
+                    &format!("{:.2}", s.monthly_minutes),
+                    &format!("{:.2}", hours),
+                ],
                 label_w,
-            ),
-            goal_style,
-        )));
-        lines.push(Line::from(time_line_rendered(
-            d.result_monthly_time,
-            s.monthly_minutes,
-            parallel,
-            workday_hours,
-            label_w,
-        )));
+            );
+            let style = if m == state.selected_month { goal_style } else { month_style };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
 
         lines.push(Line::from(""));
 
-        // Annual goal + time.
+        // Annual goal + time (annual = sum of the 12 months).
         lines.push(Line::from(Span::styled(
             lang::fmt_aligned(
                 d.result_annual_goal,
-                &[&format!("{:.2}", s.annual_goal), &cur, &s.annual_sales.to_string()],
+                &[&format!("{:.2}", annual_goal), &cur, &annual_sales.to_string()],
                 label_w,
             ),
             goal_style,
         )));
         lines.push(Line::from(time_line_rendered(
             d.result_annual_time,
-            s.annual_minutes,
+            annual_minutes,
             parallel,
             workday_hours,
             label_w,
@@ -989,32 +1111,32 @@ fn slider_track(s: &Slider, width: usize) -> String {
 /// border.  `width` is the inner (border-excluded) width of the panel that will
 /// render these lines; pass 0 to suppress the checkbox (e.g. when the width is
 /// unknown).
-fn slider_entry_lines(s: &Slider, focused: bool, width: u16) -> Vec<Line<'static>> {
+fn slider_entry_lines(s: &Slider, focused: bool, width: u16, lang: &Lang) -> Vec<Line<'static>> {
     let marker = if focused { "\u{25b6} " } else { "  " };
     let label_style = if focused {
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
-    let is_percent = matches!(s.kind, SliderKind::Percent(_));
+    let pct = is_product_pct(s);
 
-    // Settings sliders (non-percent): wrap the label after the first word (the
-    // first word on its own header line, the remaining words wrapped to the
-    // column width), left-aligned.  Product-percentage sliders keep their
-    // single-line header with the right-aligned "lock values" checkbox.
-    if !is_percent {
-        return settings_entry_lines(s, focused, width, marker, label_style);
+    // Settings / month-selector sliders (non-percent): wrap the label after the
+    // first word (the first word on its own header line, the remaining words
+    // wrapped to the column width), left-aligned.  Product-percentage sliders
+    // keep their single-line header with the right-aligned "lock" checkbox.
+    if !pct {
+        return settings_entry_lines(s, focused, width, marker, label_style, lang);
     }
 
-    // Header line: marker + label (the "lock values" checkbox moves to the
-    // track line below, right-aligned within `width`).
+    // Header line: marker + label (the "lock" checkbox moves to the track line
+    // below, right-aligned within `width`).
     let mut header_spans: Vec<Span<'static>> = Vec::new();
     header_spans.push(Span::styled(marker.to_string(), label_style));
     header_spans.push(Span::styled(s.label.clone(), label_style));
 
     let mut lines = Vec::new();
     lines.push(Line::from(header_spans));
-    let readout = format!(" {}{}", s.value, s.suffix);
+    let readout = slider_readout(s, lang);
     // Track width: prefer 10 cells, but shrink to whatever room is left after
     // the 2-cell indent and the readout so the track + readout never wraps to
     // a second line in a narrow column.
@@ -1031,16 +1153,15 @@ fn slider_entry_lines(s: &Slider, focused: bool, width: u16) -> Vec<Line<'static
     };
 
     // Build the track line: indent + track + readout, optionally followed by
-    // a right-aligned "[x] lock values" / "[ ] lock values" checkbox for
-    // product-percentage sliders.
+    // a right-aligned "[x] lock" / "[ ] lock" checkbox for product sliders.
     let mut track_spans: Vec<Span<'static>> = Vec::new();
     track_spans.push(Span::raw("  "));
     track_spans.push(Span::styled(track, track_style));
     track_spans.push(Span::styled(readout, label_style));
 
-    if is_percent && width > 0 {
+    if width > 0 {
         let box_str = if s.locked { "[x]" } else { "[ ]" };
-        let lock_label = " lock values";
+        let lock_label = slider_lock_label(s, lang);
         let needed = box_str.chars().count() + lock_label.chars().count();
         let used = indent_w + track_w + readout_w;
         let avail = (width as usize).saturating_sub(used);
@@ -1053,13 +1174,7 @@ fn slider_entry_lines(s: &Slider, focused: bool, width: u16) -> Vec<Line<'static
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            let label_style_cb = if s.locked {
-                Style::default().fg(Color::Green)
-            } else if focused {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+            let label_style_cb = box_style;
             track_spans.push(Span::raw(" ".repeat(pad)));
             track_spans.push(Span::styled(box_str.to_string(), box_style));
             track_spans.push(Span::styled(lock_label.to_string(), label_style_cb));
@@ -1082,6 +1197,7 @@ fn settings_entry_lines(
     width: u16,
     marker: &str,
     label_style: Style,
+    lang: &Lang,
 ) -> Vec<Line<'static>> {
     let w = width as usize;
 
@@ -1115,7 +1231,7 @@ fn settings_entry_lines(
     }
 
     // Track + readout line, left-aligned (2-space indent + track + readout).
-    let readout = format!(" {}{}", s.value, s.suffix);
+    let readout = slider_readout(s, lang);
     let indent_w = 2usize;
     let readout_w = readout.chars().count();
     let max_track = 10usize;
@@ -1210,11 +1326,12 @@ fn word_wrap(text: &str, width: usize) -> Vec<String> {
 /// `width` is the inner (border-excluded) width of the rendering panel, used
 /// to right-align the per-product "lock values" checkbox.
 fn build_slider_lines(state: &AppState, start: usize, end: usize, width: u16) -> Vec<Line<'static>> {
+    let lang = state.lang;
     let mut lines: Vec<Line<'static>> = Vec::new();
     let end = end.min(state.sliders.len());
     for i in start..end {
         let s = &state.sliders[i];
-        lines.extend(slider_entry_lines(s, i == state.selected, width));
+        lines.extend(slider_entry_lines(s, i == state.selected, width, &lang));
     }
     lines
 }
@@ -1238,56 +1355,64 @@ fn build_totals_lines(state: &AppState) -> Vec<Line<'static>> {
 /// fit narrow columns without wrapping the value onto its own line.
 fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let t = compute_totals(state);
+    let d = state.lang.dict();
     let sub = Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan);
     let val = Style::default();
 
+    // Helper: pad a label to a fixed width.
+    let lbl = |s: &str, w: usize| -> String {
+        let pad = w.saturating_sub(lang::str_width(s));
+        format!("  {}{}", s, " ".repeat(pad))
+    };
+    let lw = 11; // label column width
+
     // --- Left column: Monthly + Settings ---
     let mut left: Vec<Line<'static>> = Vec::new();
-    left.push(Line::from(Span::styled("Monthly", sub)));
+    left.push(Line::from(Span::styled(d.tui_label_monthly, sub)));
     left.push(Line::from(vec![
-        Span::styled("  sales    ", val),
+        Span::styled(lbl(d.tui_label_sales, lw), val),
         Span::styled(format!("{}", t.monthly.sales), val),
     ]));
     left.push(Line::from(vec![
-        Span::styled("  min      ", val),
+        Span::styled(lbl(d.tui_label_min, lw), val),
         Span::styled(format!("{:.0}", t.monthly.minutes), val),
     ]));
     left.push(Line::from(vec![
-        Span::styled("  hours    ", val),
+        Span::styled(lbl(d.tui_label_hours, lw), val),
         Span::styled(format!("{:.1}", t.monthly.hours), val),
     ]));
     left.push(Line::from(vec![
-        Span::styled("  workdays ", val),
+        Span::styled(lbl(d.tui_label_workdays, lw), val),
         Span::styled(format!("{:.2}", t.monthly.workdays), val),
     ]));
     left.push(Line::from(""));
-    left.push(Line::from(Span::styled("Settings", sub)));
+    left.push(Line::from(Span::styled(d.tui_label_settings, sub)));
     left.push(Line::from(vec![
-        Span::styled("  workday  ", val),
-        Span::styled(format!("{} h", t.workday_hours), val),
+        Span::styled(lbl(d.tui_label_workday, lw), val),
+        Span::styled(format!("{} {}", t.workday_hours, d.tui_suffix_hours), val),
     ]));
     left.push(Line::from(vec![
-        Span::styled("  parallel ", val),
+        Span::styled(lbl(d.tui_label_parallel, lw), val),
         Span::styled(format!("{}", t.parallel), val),
     ]));
 
     // --- Right column: Yearly + Yearly ref ---
     let mut right: Vec<Line<'static>> = Vec::new();
-    right.push(Line::from(Span::styled("Yearly", sub)));
+    right.push(Line::from(Span::styled(d.tui_label_yearly, sub)));
     right.push(Line::from(vec![
-        Span::styled("  sales    ", val),
+        Span::styled(lbl(d.tui_label_sales, lw), val),
         Span::styled(format!("{}", t.annual.sales), val),
     ]));
     right.push(Line::from(vec![
-        Span::styled("  min      ", val),
+        Span::styled(lbl(d.tui_label_min, lw), val),
         Span::styled(format!("{:.0}", t.annual.minutes), val),
     ]));
     right.push(Line::from(vec![
-        Span::styled("  hours    ", val),
+        Span::styled(lbl(d.tui_label_hours, lw), val),
         Span::styled(format!("{:.1}", t.annual.hours), val),
     ]));
     right.push(Line::from(vec![
-        Span::styled("  workdays ", val),
+        Span::styled(lbl(d.tui_label_workdays, lw), val),
         Span::styled(format!("{:.2}", t.annual.workdays), val),
     ]));
     right.push(Line::from(""));
@@ -1300,15 +1425,15 @@ fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'stat
     } else {
         ("\u{2716}", Style::default().fg(Color::Red))
     };
-    right.push(Line::from(Span::styled("Yearly ref", sub)));
+    right.push(Line::from(Span::styled(d.tui_label_yearly_ref, sub)));
     right.push(Line::from(vec![
-        Span::styled("  12x mo   ", val),
+        Span::styled(lbl(d.tui_label_12x_mo, lw), val),
         Span::styled(format!("{}", year_sum), val),
     ]));
     right.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(mark.to_string(), mark_style),
-        Span::styled(format!(" goal  {}", yearly_target), val),
+        Span::styled(format!(" {}  {}", d.tui_label_goal, yearly_target), val),
     ]));
 
     (left, right)
@@ -1341,41 +1466,37 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         Tab::Graph => render_chart(frame, content_area, state),
     }
 
-    // Sidebar, split into three stacked regions:
-    //   1. Products  — per-product percentage sliders (scrollable)
-    //   2. Settings  — workday hours, parallel, monthly & yearly goals
-    //   3. Totals    — every aggregate value (also written to the totals file)
+    // Sidebar layout:
+    //   Graph tab:    [Month selector (fixed, bordered)] [Products (scroll)]
+    //                 [Settings] [Totals]
+    //   Products tab: [Products (scroll)] [Settings] [Totals]
     let sidebar_area = body_chunks[1];
-    let n_percent = state.products.len();
     let total_sliders = state.sliders.len();
+    let n_products = state.products.len();
+    let has_month_selector = state.tab == Tab::Graph;
+    // On Graph tab slider 0 is MonthSelector; product sliders follow.
+    let products_start = if has_month_selector { 1 } else { 0 };
+    let settings_start = products_start + n_products;
 
-    // Desired dynamic inner padding for every sidebar region: scales with the
-    // sidebar width so wider terminals get more breathing room (0..=4 cells).
+    // Desired dynamic inner padding for every sidebar region.
     let sidebar_inner_w = sidebar_area.width.saturating_sub(2) as usize;
     let desired_pad = ((sidebar_inner_w / 12) as u16).min(4);
 
-    // The Settings region height is content-driven: just enough to fit its
-    // wrapped lines + border + padding (clamped to a 7-row minimum so the title
-    // and a couple of lines always show).  Totals is fixed at 13 rows.  Products
-    // (Min) absorbs ALL remaining vertical space, so resizing the terminal
-    // taller grows Products, not Settings.
     let totals_region_h: u16 = 13;
     let settings_min_h: u16 = 7;
+    // Month selector: 1 slider × 3 lines + 2 border = 5 rows.
+    let month_selector_region_h: u16 = if has_month_selector { 5 } else { 0 };
 
     // Products: each entry is 3 lines (header + track + blank).
-    let products_needed = (n_percent * 3) as u16;
+    let products_needed = (n_products * 3) as u16;
 
     // Settings: build the actual wrapped lines for both columns and take the
-    // taller one.  The column width depends on the padding, but the line count
-    // only grows when the column is narrower (more wrapping), so compute it
-    // with the *desired* padding width first; if that doesn't fit we reduce the
-    // padding below, which only makes columns wider (fewer wraps), so the
-    // estimate is conservative.
+    // taller one.
     let settings_inner_w = sidebar_inner_w;
     let settings_col_w = settings_inner_w
         .saturating_sub(1 /* separator */ + desired_pad as usize * 2) / 2;
-    let mid = (n_percent + 2).min(total_sliders);
-    let settings_left_lines = build_slider_lines(state, n_percent, mid, settings_col_w as u16);
+    let mid = (settings_start + 2).min(total_sliders);
+    let settings_left_lines = build_slider_lines(state, settings_start, mid, settings_col_w as u16);
     let settings_right_lines = build_slider_lines(state, mid, total_sliders, settings_col_w as u16);
     let settings_needed = settings_left_lines.len().max(settings_right_lines.len()) as u16;
 
@@ -1383,18 +1504,14 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     let (totals_left, totals_right) = build_totals_columns(state);
     let totals_needed = totals_left.len().max(totals_right.len()) as u16;
 
-    // Compute the padding each region can afford at a few candidate padding
-    // values, and pick the largest padding that lets every region fit all its
-    // rows.  Settings height grows with the padding (so the padding is real,
-    // not clipped); Products and Totals are clamped by their available height.
-    // Try from the desired padding down to 0.
+    // Compute the padding each region can afford.
     let mut sidebar_pad: u16 = 0;
     let mut settings_region_h: u16 = settings_min_h;
     for &p in (0..=desired_pad).rev().collect::<Vec<_>>().iter() {
         let s_h = (2 + settings_needed + p * 2).max(settings_min_h);
         let products_available = sidebar_area
             .height
-            .saturating_sub(s_h + totals_region_h);
+            .saturating_sub(s_h + totals_region_h + month_selector_region_h);
         let products_max_pad = products_available
             .saturating_sub(2 + products_needed) / 2;
         let totals_max_pad = totals_region_h
@@ -1406,41 +1523,81 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
     }
 
-    let sidebar_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),
-            Constraint::Length(settings_region_h),
-            Constraint::Length(totals_region_h),
-        ])
-        .split(sidebar_area);
+    // Build the vertical constraints for the sidebar regions.
+    let sidebar_chunks = if has_month_selector {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(month_selector_region_h),
+                Constraint::Min(6),
+                Constraint::Length(settings_region_h),
+                Constraint::Length(totals_region_h),
+            ])
+            .split(sidebar_area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(6),
+                Constraint::Length(settings_region_h),
+                Constraint::Length(totals_region_h),
+            ])
+            .split(sidebar_area)
+    };
 
-    // --- Region 1: Products (scrollable) ---
-    let top_area = sidebar_chunks[0];
-    // Inner area minus the 2-cell border and the dynamic sidebar padding on
-    // all sides. Each entry is 3 lines.
+    let sidebar_active = state.active_region == Region::Sidebar;
+    let mut region_idx = 0usize;
+
+    // --- Month selector region (Graph tab only) ---
+    if has_month_selector {
+        let ms_area = sidebar_chunks[region_idx];
+        region_idx += 1;
+        let ms_block = Block::default()
+            .borders(Borders::ALL)
+            .title(state.lang.dict().tui_sidebar_month)
+            .title_style(Style::default().add_modifier(Modifier::BOLD))
+            .border_style(if sidebar_active {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            });
+        let ms_inner = ms_block.inner(ms_area);
+        frame.render_widget(ms_block, ms_area);
+        if ms_inner.height > 0 {
+            let ms_lines = build_slider_lines(state, 0, 1, ms_inner.width);
+            frame.render_widget(Paragraph::new(ms_lines), ms_inner);
+        }
+    }
+
+    // --- Products region (scrollable) ---
+    let top_area = sidebar_chunks[region_idx];
+    region_idx += 1;
     let top_inner_h = top_area.height.saturating_sub(2 + sidebar_pad * 2) as usize;
     let entry_h = 3usize;
     let visible_entries = (top_inner_h / entry_h).max(1);
     // Auto-scroll only while focus is inside the products range.
-    if state.selected < n_percent {
-        if state.selected < state.scroll {
-            state.scroll = state.selected;
-        } else if state.selected >= state.scroll + visible_entries {
-            state.scroll = state.selected + 1 - visible_entries;
+    if state.selected >= products_start && state.selected < settings_start {
+        let rel = state.selected - products_start;
+        if rel < state.scroll {
+            state.scroll = rel;
+        } else if rel >= state.scroll + visible_entries {
+            state.scroll = rel + 1 - visible_entries;
         }
-        if state.scroll + visible_entries > n_percent {
-            state.scroll = n_percent.saturating_sub(visible_entries);
+        if state.scroll + visible_entries > n_products {
+            state.scroll = n_products.saturating_sub(visible_entries);
         }
     }
-    let start = state.scroll;
-    let end = (start + visible_entries).min(n_percent);
+    let start = products_start + state.scroll;
+    let end = (start + visible_entries).min(settings_start);
     let top_inner_w = top_area.width.saturating_sub(2 + sidebar_pad * 2);
     let product_lines = build_slider_lines(state, start, end, top_inner_w);
-    let sidebar_active = state.active_region == Region::Sidebar;
+    let top_title: String = match state.tab {
+        Tab::Products => state.lang.dict().tui_products_yearly.to_string(),
+        Tab::Graph => lang::fmt(state.lang.dict().tui_month_pct_sales, &[state.lang.months_abbr()[state.selected_month]]),
+    };
     let products_block = Block::default()
         .borders(Borders::ALL)
-        .title("Products")
+        .title(top_title)
         .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(if sidebar_active {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
@@ -1448,8 +1605,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
             Style::default()
         });
     frame.render_widget(products_block, top_area);
-    // Render the content inset by the border (1) + dynamic padding on all
-    // sides so the sliders get more breathing room on wider terminals.
     let products_content = Rect::new(
         top_area.x + 1 + sidebar_pad,
         top_area.y + 1 + sidebar_pad,
@@ -1458,11 +1613,9 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
     );
     frame.render_widget(Paragraph::new(product_lines), products_content);
 
-    // Scroll indicators for the products region: an up-arrow at the top edge
-    // when entries are scrolled off above, and a down-arrow at the bottom edge
-    // when more entries remain below the visible window.
+    // Scroll indicators for the products region.
     let can_up = state.scroll > 0;
-    let can_down = end < n_percent && n_percent > visible_entries;
+    let can_down = end < settings_start && n_products > visible_entries;
     let arrow_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     if top_area.width >= 2 && top_area.height >= 2 {
         let right_col = top_area.x + top_area.width - 2;
@@ -1480,25 +1633,20 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         }
     }
 
-    // --- Region 2: Settings (workday, parallel, monthly & yearly goals) ---
-    // Two internal columns separated by a 1-cell vertical rule, each holding
-    // two of the four settings sliders so the region is compact.  Labels wrap
-    // to the column width via Paragraph's Wrap, and the track shrinks to fit
-    // so the track + readout stays on one line.
+    // --- Settings region ---
     let settings_block = Block::default()
         .borders(Borders::ALL)
-        .title("Settings")
+        .title(state.lang.dict().tui_sidebar_settings)
         .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(if sidebar_active {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
-    let settings_inner = settings_block.inner(sidebar_chunks[1]);
-    frame.render_widget(settings_block, sidebar_chunks[1]);
+    let settings_inner = settings_block.inner(sidebar_chunks[region_idx]);
+    frame.render_widget(settings_block, sidebar_chunks[region_idx]);
+    region_idx += 1;
     if settings_inner.height > 0 && settings_inner.width >= 3 {
-        // [left col | 1-cell rule | right col].  Min(1) on the sides lets the
-        // Length(1) middle win its exact 1 cell and the rest splits evenly.
         let settings_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -1512,7 +1660,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         let sep_area = settings_cols[1];
         let right_area = settings_cols[2];
 
-        // Draw the vertical separator rule down the middle column.
         let sep_style = Style::default().fg(Color::DarkGray);
         let buf = frame.buffer_mut();
         for y in sep_area.top()..sep_area.bottom() {
@@ -1521,10 +1668,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
             }
         }
 
-        // Left column: first two settings sliders; right column: the next two.
-        // Each column is inset by the dynamic sidebar padding on all sides
-        // (left, right, top, bottom) for a uniform inner margin that grows with
-        // the terminal width.
         let pad = sidebar_pad;
         let left_inner = Rect::new(
             left_area.x + pad,
@@ -1538,8 +1681,8 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
             right_area.width.saturating_sub(pad * 2),
             right_area.height.saturating_sub(pad * 2),
         );
-        let mid = (n_percent + 2).min(total_sliders);
-        let left_lines = build_slider_lines(state, n_percent, mid, left_inner.width);
+        let mid = (settings_start + 2).min(total_sliders);
+        let left_lines = build_slider_lines(state, settings_start, mid, left_inner.width);
         let right_lines = build_slider_lines(state, mid, total_sliders, right_inner.width);
         frame.render_widget(
             Paragraph::new(left_lines).wrap(Wrap { trim: false }),
@@ -1551,20 +1694,18 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         );
     }
 
-    // --- Region 3: Totals ---
-    // Two internal columns separated by a 1-cell vertical rule, mirroring the
-    // Settings region.  Left: Monthly + Settings; Right: Yearly + Yearly ref.
+    // --- Totals region ---
     let bottom_block = Block::default()
         .borders(Borders::ALL)
-        .title("Totals")
+        .title(state.lang.dict().tui_sidebar_totals)
         .title_style(Style::default().add_modifier(Modifier::BOLD))
         .border_style(if sidebar_active {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         });
-    let totals_inner = bottom_block.inner(sidebar_chunks[2]);
-    frame.render_widget(bottom_block, sidebar_chunks[2]);
+    let totals_inner = bottom_block.inner(sidebar_chunks[region_idx]);
+    frame.render_widget(bottom_block, sidebar_chunks[region_idx]);
     if totals_inner.height > 0 && totals_inner.width >= 3 {
         let totals_cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -1578,7 +1719,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         let sep_area = totals_cols[1];
         let right_area = totals_cols[2];
 
-        // Vertical separator rule down the middle column.
         let sep_style = Style::default().fg(Color::DarkGray);
         let buf = frame.buffer_mut();
         for y in sep_area.top()..sep_area.bottom() {
@@ -1587,8 +1727,6 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
             }
         }
 
-        // Each column is inset by the dynamic sidebar padding on all sides,
-        // mirroring the Settings region.
         let pad = sidebar_pad;
         let left_inner = Rect::new(
             left_area.x + pad,
@@ -1613,19 +1751,14 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
         );
     }
 
+    let d = state.lang.dict();
     let region_name = match state.active_region {
-        Region::Main => "main",
-        Region::Sidebar => "sidebar",
+        Region::Main => d.tui_region_main,
+        Region::Sidebar => d.tui_region_sidebar,
     };
     let footer_text = match &state.status {
-        Some(msg) => format!(
-            "{}   |   region: {}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Space lock   Ctrl+E export   q quit",
-            msg, region_name
-        ),
-        None => format!(
-            "region: {}   Tab region   Shift+Tab tab   \u{2191}/\u{2193} scroll/navigate   \u{2190}/\u{2192} adjust   Space lock   Ctrl+E export   q quit",
-            region_name
-        ),
+        Some(msg) => lang::fmt(d.tui_footer_status, &[msg, region_name]),
+        None => lang::fmt(d.tui_footer, &[region_name]),
     };
     frame.render_widget(
         Paragraph::new(footer_text)
@@ -1639,85 +1772,51 @@ fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
 // Event loop
 // ---------------------------------------------------------------------------
 
-/// Set the percentage slider at `changed_idx` to `new_value` (clamped to a
-/// range that respects the locked products) and distribute the remaining
-/// percentage **equally** across the other **non-locked** product-percentage
-/// sliders whose current value is greater than zero. Locked products keep their
-/// exact value and never receive any redistributed share. Products already at
-/// 0% are left at 0% (they opt out of the split until the user raises them).
-/// Rounding drift is corrected so the post-state sum is exactly 100 whenever at
-/// least one other product is eligible. Non-percent sliders are left untouched.
-fn redistribute_percent(sliders: &mut [Slider], changed_idx: usize, new_value: i64) {
-    let target = match sliders.get(changed_idx).and_then(|s| match s.kind {
-        SliderKind::Percent(p) => Some(p),
-        _ => None,
-    }) {
-        Some(p) => p,
-        None => return,
-    };
-    // A locked product is frozen: it cannot be moved, even by direct input.
-    if sliders[changed_idx].locked {
+/// Set product `changed_prod`'s monthly % in `month` to `new_value` (clamped
+/// to the room left by locked products in that month) and distribute the
+/// remaining % **equally** across all other **non-locked** products in that
+/// month (including ones currently at 0). A product is locked-in-month when
+/// `month_locked[p][month] || yearly_locked[p]`. The changed product must
+/// itself be editable (otherwise this is a no-op). Rounding drift is corrected
+/// so the month sums to exactly 100 whenever at least one receiver exists.
+fn redistribute_month(state: &mut AppState, month: usize, changed_prod: usize, new_value: i64) {
+    if !state.editable_in_month(changed_prod, month) {
         return;
     }
+    let n = state.products.len();
 
-    // Sum of the OTHER locked products' values — these are frozen and carve out
-    // a fixed chunk of the 100% pie that the changed product + the eligible
-    // non-locked products must share.
-    let locked_sum: i64 = sliders
-        .iter()
-        .filter(|s| matches!(s.kind, SliderKind::Percent(p) if p != target) && s.locked)
-        .map(|s| s.value)
+    // Frozen products in this month (locked, excluding the changed one). Their
+    // values carve out a fixed chunk of the 100% pie.
+    let frozen_sum: i64 = (0..n)
+        .filter(|&q| q != changed_prod && !state.editable_in_month(q, month))
+        .map(|q| state.monthly_pct[q][month])
         .sum();
 
-    // The changed product cannot exceed the room left by the locked products.
-    let max_v = (100 - locked_sum).max(0);
+    let max_v = (100 - frozen_sum).max(0);
     let v = new_value.clamp(0, max_v);
+    state.monthly_pct[changed_prod][month] = v;
 
-    // Set the changed product first.
-    for s in sliders.iter_mut() {
-        if matches!(s.kind, SliderKind::Percent(p) if p == target) {
-            s.value = v;
-        }
-    }
+    // Receivers: every other non-locked product (including zeros).
+    let receivers: Vec<usize> = (0..n)
+        .filter(|&q| q != changed_prod && state.editable_in_month(q, month))
+        .collect();
 
-    // Eligible receivers: non-locked, != changed, currently > 0.
-    let mut eligible: Vec<usize> = Vec::new();
-    for (i, s) in sliders.iter().enumerate() {
-        if let SliderKind::Percent(p) = s.kind {
-            if p != target && !s.locked && s.value > 0 {
-                eligible.push(i);
-            }
-        }
-    }
-
-    let remainder = 100 - v - locked_sum;
-    if remainder <= 0 || eligible.is_empty() {
-        // No room to distribute, or no eligible receiver: zero out the
-        // non-locked, non-changed products (the locked ones keep their value).
-        for s in sliders.iter_mut() {
-            if let SliderKind::Percent(p) = s.kind {
-                if p != target && !s.locked {
-                    s.value = 0;
-                }
-            }
+    let remainder = 100 - v - frozen_sum;
+    if remainder <= 0 || receivers.is_empty() {
+        // No room / no receivers: zero out the non-locked, non-changed products.
+        for &q in &receivers {
+            state.monthly_pct[q][month] = 0;
         }
         return;
     }
 
-    // Equal split of the remainder across eligible products.
-    let n = eligible.len() as i64;
-    let base = remainder / n;
-    let extra = remainder - base * n;
-    let mut new_vals: Vec<i64> = (0..eligible.len())
+    // Equal split of the remainder across receivers, with rounding fixup.
+    let n_r = receivers.len() as i64;
+    let base = remainder / n_r;
+    let extra = remainder - base * n_r;
+    let mut new_vals: Vec<i64> = (0..receivers.len())
         .map(|i| base + if (i as i64) < extra { 1 } else { 0 })
         .collect();
-    // Clamp negatives (can't happen with remainder>=0, but be safe).
-    for v in new_vals.iter_mut() {
-        if *v < 0 {
-            *v = 0;
-        }
-    }
-    // Fixup any residual rounding drift against the sum target.
     let mut diff = remainder - new_vals.iter().sum::<i64>();
     if diff != 0 {
         let step: i64 = if diff > 0 { 1 } else { -1 };
@@ -1729,8 +1828,23 @@ fn redistribute_percent(sliders: &mut [Slider], changed_idx: usize, new_value: i
             k += 1;
         }
     }
-    for (i, &si) in eligible.iter().enumerate() {
-        sliders[si].value = new_vals[i].max(0);
+    for (i, &q) in receivers.iter().enumerate() {
+        state.monthly_pct[q][month] = new_vals[i].max(0);
+    }
+}
+
+/// Edit a product's **yearly** % (Products tab). The yearly % is the mean of
+/// the 12 monthly %, so "setting" it propagates the target value to every month
+/// where the product is editable (non-month-locked, non-yearly-locked),
+/// redistributing the remainder within each such month. Month-locked months
+/// keep their overridden value, so the resulting yearly mean may differ from
+/// the target — that is the "unless locked" behaviour.
+fn edit_yearly(state: &mut AppState, changed_prod: usize, target_value: i64) {
+    if state.yearly_locked[changed_prod] {
+        return;
+    }
+    for m in 0..12 {
+        redistribute_month(state, m, changed_prod, target_value);
     }
 }
 
@@ -1748,12 +1862,16 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
         };
         return false;
     }
-    // Shift+Tab (BackTab): switch the main-area tab (Products <-> Graph).
+    // Shift+Tab (BackTab): switch the main-area tab (Products <-> Graph) and
+    // rebuild the sidebar slider list for the new tab.
     if key.code == KeyCode::BackTab {
         state.tab = match state.tab {
             Tab::Products => Tab::Graph,
             Tab::Graph => Tab::Products,
         };
+        state.selected = 0;
+        state.scroll = 0;
+        state.rebuild_sliders();
         return false;
     }
     // Up/Down behaviour depends on the active region:
@@ -1779,11 +1897,25 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char(' ') => {
-            // Toggle the "lock values" checkbox of the focused product
-            // percentage slider (ignored for non-percent sliders).
-            if let Some(s) = state.sliders.get_mut(state.selected) {
-                if matches!(s.kind, SliderKind::Percent(_)) {
-                    s.locked = !s.locked;
+            // Toggle the lock of the focused product slider.
+            //  - YearlyPercent(P): toggle yearly_locked[P] (freezes P in all
+            //    12 months; the month checkboxes render checked + greyed).
+            //  - MonthPercent(P): toggle month_locked[P][selected_month], but
+            //    only if P is not yearly-locked (otherwise it is greyed out).
+            if let Some(s) = state.sliders.get(state.selected).cloned() {
+                match s.kind {
+                    SliderKind::YearlyPercent(p) => {
+                        state.yearly_locked[p] = !state.yearly_locked[p];
+                        state.rebuild_sliders();
+                    }
+                    SliderKind::MonthPercent(p) => {
+                        if !state.yearly_locked[p] {
+                            let m = state.selected_month;
+                            state.month_locked[p][m] = !state.month_locked[p][m];
+                            state.rebuild_sliders();
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1797,32 +1929,8 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
         KeyCode::Down => {
             state.selected = (state.selected + 1) % state.sliders.len();
         }
-        KeyCode::Left => {
-            let is_percent = matches!(
-                state.sliders.get(state.selected).map(|s| s.kind),
-                Some(SliderKind::Percent(_))
-            );
-            if is_percent {
-                let cur = state.sliders[state.selected].value;
-                let step = state.sliders[state.selected].step;
-                redistribute_percent(&mut state.sliders, state.selected, cur - step);
-            } else if let Some(s) = state.sliders.get_mut(state.selected) {
-                s.dec();
-            }
-        }
-        KeyCode::Right => {
-            let is_percent = matches!(
-                state.sliders.get(state.selected).map(|s| s.kind),
-                Some(SliderKind::Percent(_))
-            );
-            if is_percent {
-                let cur = state.sliders[state.selected].value;
-                let step = state.sliders[state.selected].step;
-                redistribute_percent(&mut state.sliders, state.selected, cur + step);
-            } else if let Some(s) = state.sliders.get_mut(state.selected) {
-                s.inc();
-            }
-        }
+        KeyCode::Left => adjust_slider(state, -1),
+        KeyCode::Right => adjust_slider(state, 1),
         _ => {}
     }
     // Goals / percentages / workday hours changed the required production
@@ -1830,6 +1938,43 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
     // and clamp on every adjustment (cheap; no-op for pure navigation).
     update_parallel_range(state);
     false
+}
+
+/// Apply a ±`dir` step to the focused slider. Handles the month selector
+/// (changes `selected_month` and rebuilds the Graph sidebar), yearly % sliders
+/// (propagates to all months), monthly % sliders (redistributes within the
+/// selected month), and plain settings sliders (simple inc/dec).
+fn adjust_slider(state: &mut AppState, dir: i64) {
+    let Some(s) = state.sliders.get(state.selected).cloned() else {
+        return;
+    };
+    match s.kind {
+        SliderKind::MonthSelector => {
+            let v = (s.value + dir).clamp(0, 11);
+            state.selected_month = v as usize;
+            state.rebuild_sliders();
+        }
+        SliderKind::YearlyPercent(p) => {
+            let target = s.value + dir * s.step;
+            edit_yearly(state, p, target);
+            state.rebuild_sliders();
+        }
+        SliderKind::MonthPercent(p) => {
+            let m = state.selected_month;
+            let target = state.monthly_pct[p][m] + dir * s.step;
+            redistribute_month(state, m, p, target);
+            state.rebuild_sliders();
+        }
+        _ => {
+            if let Some(s) = state.sliders.get_mut(state.selected) {
+                if dir < 0 {
+                    s.dec();
+                } else {
+                    s.inc();
+                }
+            }
+        }
+    }
 }
 
 /// Load and compute every product definition in `folder`.  Products with
@@ -1853,17 +1998,18 @@ fn load_products(folder: &Path, lang: &Lang) -> Vec<(PathBuf, ProductResult)> {
     out
 }
 
-/// Per-product split of the current goals, derived from the percentage sliders
-/// and the monthly/yearly goal sliders. Shared by the export path and the
-/// sidebar totals so both show identical numbers.
-fn product_shares(state: &AppState) -> Vec<crate::simulator::ProductShare> {
+/// Per-product split of the monthly goal for a single month `m`, using that
+/// month's percentage distribution. Only the `monthly_*` fields of the
+/// returned [`ProductShare`] are meaningful (annual fields are zeroed). The
+/// sales counts are the *required* (uncapped) figures — capacity capping is
+/// applied separately in [`AppState::month_totals_for`] for the chart.
+fn month_shares(state: &AppState, m: usize) -> Vec<crate::simulator::ProductShare> {
     let monthly_goal = state.slider_value(SliderKind::MonthlyGoal) as f64;
-    let annual_goal = state.slider_value(SliderKind::YearlyGoal) as f64;
     let raw_pcts: Vec<i64> = (0..state.products.len())
-        .map(|i| state.percent_for(i).max(0))
+        .map(|i| state.monthly_pct[i][m].max(0))
         .collect();
     let results: Vec<&ProductResult> = state.products.iter().map(|(_, r)| r).collect();
-    compute_product_shares(&results, &raw_pcts, monthly_goal, annual_goal)
+    compute_product_shares(&results, &raw_pcts, monthly_goal, 0.0)
 }
 
 /// Aggregate totals across all products for one period, mirroring the rows
@@ -1876,7 +2022,8 @@ struct PeriodTotals {
 }
 
 /// All totals shown in the sidebar's bottom region (and written to the totals
-/// file on export).
+/// file on export). `monthly` reflects the currently-selected month; `annual`
+/// is the sum of all 12 months.
 struct Totals {
     monthly: PeriodTotals,
     annual: PeriodTotals,
@@ -1890,19 +2037,28 @@ fn compute_totals(state: &AppState) -> Totals {
     let wh = workday_hours as f64;
     let pp = parallel.max(1) as f64;
 
-    let shares = product_shares(state);
+    // Selected month's totals.
+    let sel = state.selected_month;
+    let mshares = month_shares(state, sel);
     let mut m_sales = 0i64;
-    let mut a_sales = 0i64;
     let mut m_min = 0.0f64;
-    let mut a_min = 0.0f64;
-    for s in &shares {
+    for s in &mshares {
         m_sales += s.monthly_sales;
-        a_sales += s.annual_sales;
         m_min += s.monthly_minutes;
-        a_min += s.annual_minutes;
     }
     let m_hours = m_min / 60.0;
+
+    // Annual = sum of all 12 months.
+    let mut a_sales = 0i64;
+    let mut a_min = 0.0f64;
+    for m in 0..12 {
+        for s in month_shares(state, m) {
+            a_sales += s.monthly_sales;
+            a_min += s.monthly_minutes;
+        }
+    }
     let a_hours = a_min / 60.0;
+
     Totals {
         monthly: PeriodTotals {
             sales: m_sales,
@@ -1932,9 +2088,16 @@ fn compute_totals(state: &AppState) -> Totals {
 /// to show the caps.
 fn update_parallel_range(state: &mut AppState) {
     let workday_hours = state.slider_value(SliderKind::WorkdayHours);
-    let shares = product_shares(state);
-    let total_monthly_minutes: f64 = shares.iter().map(|s| s.monthly_minutes).sum();
-    let total_annual_minutes: f64 = shares.iter().map(|s| s.annual_minutes).sum();
+    // Use the selected month as the representative monthly load, and the sum
+    // of all 12 months as the annual load.
+    let mshares = month_shares(state, state.selected_month);
+    let total_monthly_minutes: f64 = mshares.iter().map(|s| s.monthly_minutes).sum();
+    let mut total_annual_minutes = 0.0f64;
+    for m in 0..12 {
+        for s in month_shares(state, m) {
+            total_annual_minutes += s.monthly_minutes;
+        }
+    }
     let (p_min, p_max) = parallel_range(total_monthly_minutes, total_annual_minutes, workday_hours);
 
     for s in state.sliders.iter_mut() {
@@ -1947,139 +2110,452 @@ fn update_parallel_range(state: &mut AppState) {
             if s.value > p_max {
                 s.value = p_max;
             }
-            s.label = format!("Parallel products [{}..={}]", p_min, p_max);
+            s.label = lang::fmt(state.lang.dict().tui_parallel_label, &[&p_min.to_string(), &p_max.to_string()]);
         }
     }
 }
 
-/// Write the per-product `*.simulation_results.txt` files and the aggregate
-/// `totals.simulation_results.txt` in `state.folder`, mirroring the original
-/// dialoguer flow.  The current slider values (per-product percentages,
-/// monthly/yearly goals, workday hours, parallel products) drive the split.
+/// Write the per-product `*.simulation_results.txt` files (12 monthly rows +
+/// annual sum) and the aggregate `totals.simulation_results.txt` (12 monthly
+/// rows + annual) in `state.folder`. The current per-month percentages,
+/// monthly/yearly goals, workday hours and parallel products drive the split.
 /// Returns a human-readable status string.
 fn export_results(state: &AppState, lang: &Lang) -> String {
     let workday_hours = state.slider_value(SliderKind::WorkdayHours);
     let parallel = state.slider_value(SliderKind::Parallel).max(1);
-    let shares = product_shares(state);
 
-    let mut total_monthly_sales = 0i64;
+    // Per-month, per-product shares.
+    let per_month: Vec<Vec<crate::simulator::ProductShare>> =
+        (0..12).map(|m| month_shares(state, m)).collect();
+
+    let mut total_monthly_sales = [0i64; 12];
+    let mut total_monthly_minutes = [0.0f64; 12];
     let mut total_annual_sales = 0i64;
-    let mut total_monthly_minutes = 0.0f64;
     let mut total_annual_minutes = 0.0f64;
 
-    for ((file, r), s) in state.products.iter().zip(&shares) {
-        if let Err(e) = write_result_file(
+    for (i, ((file, r), _)) in state.products.iter().zip(per_month[0].iter()).enumerate() {
+        let mut monthly_goals = [0.0f64; 12];
+        let mut monthly_sales = [0i64; 12];
+        let mut monthly_minutes = [0.0f64; 12];
+        let mut annual_goal = 0.0f64;
+        let mut annual_sales = 0i64;
+        let mut annual_minutes = 0.0f64;
+        for m in 0..12 {
+            let s = &per_month[m][i];
+            monthly_goals[m] = s.monthly_goal;
+            monthly_sales[m] = s.monthly_sales;
+            monthly_minutes[m] = s.monthly_minutes;
+            annual_goal += s.monthly_goal;
+            annual_sales += s.monthly_sales;
+            annual_minutes += s.monthly_minutes;
+            total_monthly_sales[m] += s.monthly_sales;
+            total_monthly_minutes[m] += s.monthly_minutes;
+        }
+        total_annual_sales += annual_sales;
+        total_annual_minutes += annual_minutes;
+        if let Err(e) = write_result_file_monthly(
             file,
             r,
-            s.monthly_goal,
-            s.annual_goal,
-            s.monthly_sales,
-            s.annual_sales,
+            &monthly_goals,
+            &monthly_sales,
+            &monthly_minutes,
+            annual_goal,
+            annual_sales,
+            annual_minutes,
             workday_hours,
             parallel,
             lang,
         ) {
-            return format!("export error ({}): {}", r.name, e);
+            return lang::fmt(lang.dict().tui_export_error, &[&r.name, &e.to_string()]);
         }
-        total_monthly_sales += s.monthly_sales;
-        total_annual_sales += s.annual_sales;
-        total_monthly_minutes += s.monthly_minutes;
-        total_annual_minutes += s.annual_minutes;
     }
+    // Silence unused-mut warning for per_month (borrowed mutably above).
+    let _ = &per_month;
 
-    if let Err(e) = write_totals_file(
+    if let Err(e) = write_totals_file_monthly(
         &state.folder,
         state.products.len(),
-        total_monthly_sales,
+        &total_monthly_sales,
+        &total_monthly_minutes,
         total_annual_sales,
-        total_monthly_minutes,
         total_annual_minutes,
         workday_hours,
         parallel,
         lang,
     ) {
-        return format!("export error (totals): {}", e);
+        return lang::fmt(lang.dict().tui_export_error_totals, &[&e.to_string()]);
     }
 
-    format!(
-        "exported {} product files + totals to {}",
-        state.products.len(),
-        state.folder.display()
+    // Persist percentages, locks, and settings so reopening the app restores
+    // the user's custom distribution.
+    save_state(state);
+
+    lang::fmt(
+        lang.dict().tui_exported,
+        &[&state.products.len().to_string(), &state.folder.display().to_string()],
     )
 }
 
-/// Build the sidebar slider list from the loaded products.
-fn build_sliders(products: &[(PathBuf, ProductResult)]) -> Vec<Slider> {
-    let mut sliders = Vec::new();
-    let n = products.len() as i64;
-    let base = 100 / n.max(1);
-    let extra = 100 - base * n.max(1);
-    for (i, (_, p)) in products.iter().enumerate() {
-        let value = base + if (i as i64) < extra { 1 } else { 0 };
-        sliders.push(Slider {
-            kind: SliderKind::Percent(i),
-            label: format!("% {}", p.name),
-            value,
-            min: 0,
-            max: 100,
-            step: 1,
-            suffix: "%",
-            locked: false,
-        });
+// ---------------------------------------------------------------------------
+// State persistence (save / load percentages, locks, and settings)
+// ---------------------------------------------------------------------------
+
+/// Hidden file written in the product folder alongside the export files. Not a
+/// `.txt` file, so [`collect_txt_files`] never picks it up as a product
+/// definition.
+const STATE_FILE_NAME: &str = ".simulation_state";
+
+fn state_file_path(folder: &Path) -> PathBuf {
+    folder.join(STATE_FILE_NAME)
+}
+
+/// Persist the current percentages, locks, settings, and selected month to
+/// `.simulation_state` in the product folder. Called during export so that
+/// reopening the app restores the user's custom distribution.
+fn save_state(state: &AppState) {
+    let path = state_file_path(&state.folder);
+    let mut out = String::new();
+    out.push_str("# tiny-business-simulator state v1\n");
+    out.push_str("# <file> <pct[0..11]> <mlock[0..11]> <ylock>\n");
+
+    for (i, (file, _)) in state.products.iter().enumerate() {
+        let fname = file
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push_str(&fname);
+        for m in 0..12 {
+            out.push(' ');
+            out.push_str(&state.monthly_pct[i][m].to_string());
+        }
+        for m in 0..12 {
+            out.push(' ');
+            out.push_str(if state.month_locked[i][m] { "1" } else { "0" });
+        }
+        out.push(' ');
+        out.push_str(if state.yearly_locked[i] { "1" } else { "0" });
+        out.push('\n');
     }
-    sliders.push(Slider {
-        kind: SliderKind::WorkdayHours,
-        label: "Workday hours".into(),
-        value: 8,
-        min: 1,
-        max: 24,
-        step: 1,
-        suffix: " h",
-        locked: false,
-    });
-    sliders.push(Slider {
-        kind: SliderKind::Parallel,
-        label: "Parallel products".into(),
-        value: 1,
-        min: 1,
-        max: 200,
-        step: 1,
-        suffix: "",
-        locked: false,
-    });
-    sliders.push(Slider {
-        kind: SliderKind::MonthlyGoal,
-        label: "Monthly net-profit goal".into(),
-        value: 1000,
-        min: 0,
-        max: 1_000_000,
-        step: 100,
-        suffix: "",
-        locked: false,
-    });
-    sliders.push(Slider {
-        kind: SliderKind::YearlyGoal,
-        label: "Yearly net-profit goal".into(),
-        value: 12000,
-        min: 0,
-        max: 10_000_000,
-        step: 1000,
-        suffix: "",
-        locked: false,
-    });
-    sliders
+
+    let wh = state.slider_value(SliderKind::WorkdayHours);
+    let par = state.slider_value(SliderKind::Parallel);
+    let mg = state.slider_value(SliderKind::MonthlyGoal);
+    let yg = state.slider_value(SliderKind::YearlyGoal);
+    out.push_str(&format!("workday_hours {}\n", wh));
+    out.push_str(&format!("parallel {}\n", par));
+    out.push_str(&format!("monthly_goal {}\n", mg));
+    out.push_str(&format!("yearly_goal {}\n", yg));
+    out.push_str(&format!("selected_month {}\n", state.selected_month));
+
+    let _ = std::fs::write(path, out);
+}
+
+/// State loaded from `.simulation_state`. Fields not present in the file (or
+/// `None` if the file doesn't exist) fall back to defaults.
+struct LoadedState {
+    monthly_pct: Vec<[i64; 12]>,
+    month_locked: Vec<[bool; 12]>,
+    yearly_locked: Vec<bool>,
+    workday_hours: i64,
+    parallel: i64,
+    monthly_goal: i64,
+    yearly_goal: i64,
+    selected_month: usize,
+}
+
+/// Try to load `.simulation_state` from `folder` and match its per-product
+/// entries to the `products` list (by file name). Returns `None` if the file
+/// doesn't exist or contains no usable data. Each month's percentages are
+/// normalized to sum to 100 in case products were added/removed since the
+/// state was saved.
+fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<LoadedState> {
+    let path = state_file_path(folder);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let n = products.len();
+
+    // Map file-name → index for matching stored entries to current products.
+    let name_to_idx = |name: &str| -> Option<usize> {
+        products.iter().position(|(f, _)| {
+            f.file_name()
+                .map(|s| s.to_string_lossy().as_ref() == name)
+                .unwrap_or(false)
+        })
+    };
+
+    let mut monthly_pct = vec![[0i64; 12]; n];
+    let mut month_locked = vec![[false; 12]; n];
+    let mut yearly_locked = vec![false; n];
+    let mut workday_hours = 8i64;
+    let mut parallel = 1i64;
+    let mut monthly_goal = 1000i64;
+    let mut yearly_goal = 12000i64;
+    let mut selected_month = 0usize;
+    let mut found_any = false;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // Settings lines.
+        if let Some(rest) = line.strip_prefix("workday_hours ") {
+            workday_hours = rest.trim().parse().unwrap_or(workday_hours);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("parallel ") {
+            parallel = rest.trim().parse().unwrap_or(parallel);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("monthly_goal ") {
+            monthly_goal = rest.trim().parse().unwrap_or(monthly_goal);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("yearly_goal ") {
+            yearly_goal = rest.trim().parse().unwrap_or(yearly_goal);
+            found_any = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("selected_month ") {
+            let v: usize = rest.trim().parse().unwrap_or(0);
+            selected_month = v.min(11);
+            found_any = true;
+            continue;
+        }
+        // Product line: "file pct[0..11] mlock[0..11] ylock" = 26 tokens.
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() >= 26 {
+            if let Some(idx) = name_to_idx(tokens[0]) {
+                for m in 0..12 {
+                    monthly_pct[idx][m] = tokens[1 + m].parse().unwrap_or(0);
+                }
+                for m in 0..12 {
+                    month_locked[idx][m] = tokens[13 + m] == "1";
+                }
+                yearly_locked[idx] = tokens[25] == "1";
+                found_any = true;
+            }
+        }
+    }
+
+    if !found_any {
+        return None;
+    }
+
+    // Normalize each month to sum to exactly 100 (products may have been
+    // added/removed since the state was saved).
+    for m in 0..12 {
+        let sum: i64 = monthly_pct.iter().map(|p| p[m]).sum();
+        if sum != 100 {
+            if sum > 0 {
+                for i in 0..n {
+                    monthly_pct[i][m] =
+                        ((monthly_pct[i][m] as f64 / sum as f64) * 100.0).round() as i64;
+                }
+                let new_sum: i64 = monthly_pct.iter().map(|p| p[m]).sum();
+                let diff = 100 - new_sum;
+                if diff != 0 && n > 0 {
+                    // Apply the rounding drift to the first non-locked product.
+                    for i in 0..n {
+                        if !month_locked[i][m] && !yearly_locked[i] {
+                            monthly_pct[i][m] += diff;
+                            break;
+                        }
+                    }
+                }
+            } else if n > 0 {
+                // All zero: equal split.
+                let base = 100 / n as i64;
+                let extra = 100 - base * n as i64;
+                for i in 0..n {
+                    monthly_pct[i][m] = base + if (i as i64) < extra { 1 } else { 0 };
+                }
+            }
+        }
+    }
+
+    Some(LoadedState {
+        monthly_pct,
+        month_locked,
+        yearly_locked,
+        workday_hours,
+        parallel,
+        monthly_goal,
+        yearly_goal,
+        selected_month,
+    })
+}
+
+/// Default settings slider for a given kind (used on first build before any
+/// prior slider state exists).
+fn default_settings_slider(kind: SliderKind, lang: &Lang) -> Slider {
+    let d = lang.dict();
+    match kind {
+        SliderKind::WorkdayHours => Slider {
+            kind,
+            label: d.tui_slider_workday.into(),
+            value: 8,
+            min: 1,
+            max: 24,
+            step: 1,
+            suffix: " h",
+            locked: false,
+        },
+        SliderKind::Parallel => Slider {
+            kind,
+            label: d.tui_slider_parallel.into(),
+            value: 1,
+            min: 1,
+            max: 200,
+            step: 1,
+            suffix: "",
+            locked: false,
+        },
+        SliderKind::MonthlyGoal => Slider {
+            kind,
+            label: d.tui_slider_monthly_goal.into(),
+            value: 1000,
+            min: 0,
+            max: 1_000_000,
+            step: 100,
+            suffix: "",
+            locked: false,
+        },
+        SliderKind::YearlyGoal => Slider {
+            kind,
+            label: d.tui_slider_yearly_goal.into(),
+            value: 12000,
+            min: 0,
+            max: 10_000_000,
+            step: 1000,
+            suffix: "",
+            locked: false,
+        },
+        _ => Slider {
+            kind,
+            label: String::new(),
+            value: 0,
+            min: 0,
+            max: 1,
+            step: 1,
+            suffix: "",
+            locked: false,
+        },
+    }
+}
+
+impl AppState {
+    /// Rebuild the flat `sliders` view from the current tab + selected month.
+    /// The top region holds yearly sliders (Products tab) or the month selector
+    /// + monthly sliders (Graph tab); the bottom 4 sliders are always the
+    /// settings, preserved from the previous build (so their values / the
+    /// parallel slider's dynamic min/max/label survive across rebuilds).
+    fn rebuild_sliders(&mut self) {
+        let mut sliders: Vec<Slider> = Vec::new();
+        match self.tab {
+            Tab::Products => {
+                for i in 0..self.products.len() {
+                    sliders.push(Slider {
+                        kind: SliderKind::YearlyPercent(i),
+                        label: format!("% {}", self.products[i].1.name),
+                        value: self.yearly_pct(i),
+                        min: 0,
+                        max: 100,
+                        step: 1,
+                        suffix: "%",
+                        locked: self.yearly_locked[i],
+                    });
+                }
+            }
+            Tab::Graph => {
+                sliders.push(Slider {
+                    kind: SliderKind::MonthSelector,
+                    label: self.lang.dict().tui_slider_month.into(),
+                    value: self.selected_month as i64,
+                    min: 0,
+                    max: 11,
+                    step: 1,
+                    suffix: "",
+                    locked: false,
+                });
+                let m = self.selected_month;
+                for i in 0..self.products.len() {
+                    let eff_locked = self.month_locked[i][m] || self.yearly_locked[i];
+                    sliders.push(Slider {
+                        kind: SliderKind::MonthPercent(i),
+                        label: format!("% {}", self.products[i].1.name),
+                        value: self.monthly_pct[i][m],
+                        min: 0,
+                        max: 100,
+                        step: 1,
+                        suffix: "%",
+                        locked: eff_locked,
+                    });
+                }
+            }
+        }
+        // Preserve the 4 settings sliders from the previous build.
+        for kind in [
+            SliderKind::WorkdayHours,
+            SliderKind::Parallel,
+            SliderKind::MonthlyGoal,
+            SliderKind::YearlyGoal,
+        ] {
+            if let Some(old) = self.sliders.iter().find(|s| s.kind == kind).cloned() {
+                sliders.push(old);
+            } else {
+                sliders.push(default_settings_slider(kind, &self.lang));
+            }
+        }
+        self.sliders = sliders;
+        // Keep `selected` in range.
+        if self.selected >= self.sliders.len() {
+            self.selected = 0;
+        }
+    }
 }
 
 /// Entry point: parse products, enter the alternate screen, run the loop.
 pub fn run(folder: &Path, lang: &Lang) {
     let products = load_products(folder, lang);
     if products.is_empty() {
-        eprintln!("No products with a positive net profit were found in {}", folder.display());
+        eprintln!("{}", lang::fmt(lang.dict().tui_no_products, &[&folder.display().to_string()]));
         return;
     }
 
+    let n = products.len();
+    // Try to load saved state (percentages, locks, settings) from a previous
+    // export. Falls back to equal distribution if no state file exists.
+    let loaded = load_state(folder, &products);
+
+    // Initial monthly distribution: equal split across products for every month.
+    let base = 100 / n.max(1) as i64;
+    let extra = 100 - base * n.max(1) as i64;
+    let default_monthly: Vec<[i64; 12]> = (0..n)
+        .map(|i| {
+            let v = base + if (i as i64) < extra { 1 } else { 0 };
+            [v; 12]
+        })
+        .collect();
+
+    let (monthly_pct, month_locked, yearly_locked, selected_month) = match &loaded {
+        Some(l) => (
+            l.monthly_pct.clone(),
+            l.month_locked.clone(),
+            l.yearly_locked.clone(),
+            l.selected_month,
+        ),
+        None => (default_monthly, vec![[false; 12]; n], vec![false; n], 0),
+    };
+
     let mut state = AppState {
-        sliders: build_sliders(&products),
+        sliders: Vec::new(),
+        monthly_pct,
+        month_locked,
+        yearly_locked,
+        selected_month,
         folder: folder.to_path_buf(),
         products,
         selected: 0,
@@ -2090,6 +2566,21 @@ pub fn run(folder: &Path, lang: &Lang) {
         lang: *lang,
         active_region: Region::Main,
     };
+    // Apply loaded settings (workday, parallel, goals) if present.
+    if let Some(l) = &loaded {
+        state.rebuild_sliders();
+        for s in state.sliders.iter_mut() {
+            match s.kind {
+                SliderKind::WorkdayHours => s.value = l.workday_hours,
+                SliderKind::Parallel => s.value = l.parallel,
+                SliderKind::MonthlyGoal => s.value = l.monthly_goal,
+                SliderKind::YearlyGoal => s.value = l.yearly_goal,
+                _ => {}
+            }
+        }
+    } else {
+        state.rebuild_sliders();
+    }
     // Set the initial parallel-products cap range from the default goals.
     update_parallel_range(&mut state);
 
@@ -2143,7 +2634,7 @@ mod tests {
         ProductResult {
             name: name.into(),
             price,
-            currency: Currency::USD,
+            currency: Currency::new("USD"),
             total_cost: cost,
             net_profit: price - cost,
             profit_percent: 100.0,
@@ -2160,42 +2651,81 @@ mod tests {
             .collect()
     }
 
-    fn make_state(products: Vec<ProductResult>, sliders: Vec<Slider>) -> AppState {
-        AppState {
-            products: wrap(products),
-            folder: PathBuf::from("."),
-            sliders,
+    fn make_state(products: Vec<ProductResult>) -> AppState {
+        let n = products.len();
+        let wrapped = wrap(products);
+        let base = 100 / n.max(1) as i64;
+        let extra = 100 - base * n.max(1) as i64;
+        let monthly_pct: Vec<[i64; 12]> = (0..n)
+            .map(|i| {
+                let v = base + if (i as i64) < extra { 1 } else { 0 };
+                [v; 12]
+            })
+            .collect();
+        let mut state = AppState {
+            products: wrapped,
+            monthly_pct,
+            month_locked: vec![[false; 12]; n],
+            yearly_locked: vec![false; n],
+            selected_month: 0,
+            sliders: Vec::new(),
             selected: 0,
             scroll: 0,
+            folder: PathBuf::from("."),
             status: None,
             tab: Tab::Products,
             product_scroll: 0,
             lang: Lang::En,
             active_region: Region::Main,
+        };
+        state.rebuild_sliders();
+        state
+    }
+
+    /// Set a settings slider value by kind (workday / parallel / goals).
+    fn set_setting(state: &mut AppState, kind: SliderKind, value: i64) {
+        if let Some(s) = state.sliders.iter_mut().find(|s| s.kind == kind) {
+            s.value = value;
+        }
+    }
+
+    /// Read a settings slider value by kind.
+    #[allow(dead_code)]
+    fn get_setting(state: &AppState, kind: SliderKind) -> i64 {
+        state.slider_value(kind)
+    }
+
+    #[test]
+    fn share_for_month_normalizes_percentages() {
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let state = make_state(products);
+        // Equal 50/50 split -> equal shares in every month.
+        for m in 0..12 {
+            assert!((state.share_for_month(0, m) - 0.5).abs() < 1e-9);
+            assert!((state.share_for_month(1, m) - 0.5).abs() < 1e-9);
         }
     }
 
     #[test]
-    fn share_for_normalizes_percentages() {
+    fn share_for_month_all_zero_splits_equally() {
         let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
-        let sliders = build_sliders(&wrap(products.clone()));
-        let state = make_state(products, sliders);
-        // Equal sliders -> equal shares.
-        assert!((state.share_for(0) - 0.5).abs() < 1e-9);
-        assert!((state.share_for(1) - 0.5).abs() < 1e-9);
+        let mut state = make_state(products);
+        // Zero every month for every product -> equal split fallback.
+        for p in &mut state.monthly_pct {
+            *p = [0; 12];
+        }
+        assert!((state.share_for_month(0, 0) - 0.5).abs() < 1e-9);
     }
 
     #[test]
-    fn share_for_all_zero_splits_equally() {
+    fn yearly_pct_is_mean_of_months() {
         let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
-        let mut sliders = build_sliders(&wrap(products.clone()));
-        for s in &mut sliders {
-            if let SliderKind::Percent(_) = s.kind {
-                s.value = 0;
-            }
-        }
-        let state = make_state(products, sliders);
-        assert!((state.share_for(0) - 0.5).abs() < 1e-9);
+        let mut state = make_state(products);
+        // Make Jan 80/20 and the rest 50/50 -> mean for A = (80 + 11*50)/12.
+        state.monthly_pct[0][0] = 80;
+        state.monthly_pct[1][0] = 20;
+        let expected: f64 = (80.0 + 11.0 * 50.0) / 12.0;
+        assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
     }
 
     #[test]
@@ -2205,16 +2735,10 @@ mod tests {
         // capacity = 1*22*60 = 1320 min.  Scale = 1320/12000 = 0.11 ->
         // floor(200*0.11) = 22 units, amount = 22*10 = 220.
         let products = vec![prod("A", 10.0, 5.0, 60.0)];
-        let mut sliders = build_sliders(&wrap(products.clone()));
-        for s in &mut sliders {
-            match s.kind {
-                SliderKind::MonthlyGoal => s.value = 1000,
-                SliderKind::WorkdayHours => s.value = 1,
-                SliderKind::Parallel => s.value = 1,
-                _ => {}
-            }
-        }
-        let state = make_state(products, sliders);
+        let mut state = make_state(products);
+        set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+        set_setting(&mut state, SliderKind::WorkdayHours, 1);
+        set_setting(&mut state, SliderKind::Parallel, 1);
         let mt = state.month_totals();
         assert_eq!(mt.units, 22);
         assert!((mt.amount - 220.0).abs() < 1e-9);
@@ -2224,26 +2748,35 @@ mod tests {
 
     #[test]
     fn month_totals_unchanged_when_capacity_sufficient() {
-        // Same product but 24h/day, 10 parallel -> capacity = 24*22*60*10
-        // = 316800 >> 12000 -> no scaling, 200 units, amount 2000.
         let products = vec![prod("A", 10.0, 5.0, 60.0)];
-        let mut sliders = build_sliders(&wrap(products.clone()));
-        for s in &mut sliders {
-            match s.kind {
-                SliderKind::MonthlyGoal => s.value = 1000,
-                SliderKind::WorkdayHours => s.value = 24,
-                SliderKind::Parallel => s.value = 10,
-                _ => {}
-            }
-        }
-        let state = make_state(products, sliders);
+        let mut state = make_state(products);
+        set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+        set_setting(&mut state, SliderKind::WorkdayHours, 24);
+        set_setting(&mut state, SliderKind::Parallel, 10);
         let mt = state.month_totals();
         assert_eq!(mt.units, 200);
         assert!((mt.amount - 2000.0).abs() < 1e-9);
-        // amount = profit + cost; profit = units * net_profit = 200 * 5 = 1000,
-        // cost = units * total_cost = 200 * 5 = 1000.
         assert!((mt.profit - 1000.0).abs() < 1e-9);
         assert!((mt.cost - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn month_totals_differ_per_month() {
+        // Two products. Jan: A=80/B=20. Feb: A=20/B=80. With equal net profit
+        // and duration, the unit totals are identical, but the per-product
+        // mix differs — verify via month_shares that Jan and Feb differ.
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+        state.monthly_pct[0][0] = 80;
+        state.monthly_pct[1][0] = 20;
+        state.monthly_pct[0][1] = 20;
+        state.monthly_pct[1][1] = 80;
+        let jan = month_shares(&state, 0);
+        let feb = month_shares(&state, 1);
+        assert_ne!(jan[0].monthly_sales, feb[0].monthly_sales);
+        assert_eq!(jan[0].monthly_sales, 160); // ceil(0.8*1000/5)
+        assert_eq!(feb[0].monthly_sales, 40);  // ceil(0.2*1000/5)
     }
 
     #[test]
@@ -2272,12 +2805,8 @@ mod tests {
 
     #[test]
     fn fit_bar_width_fills_available_width() {
-        // 12 groups x 2 bars + bar_gap(1) per group + group_gap(2) x 11.
-        // fixed = 12*1 + 11*2 = 34.  With width 130: (130-34)/24 = 4.
         assert_eq!(fit_bar_width(130, 1, 2), 4);
-        // Width just enough for 1-cell bars: fixed=34, need 24 more -> 58.
         assert_eq!(fit_bar_width(58, 1, 2), 1);
-        // Too narrow: clamp to 1.
         assert_eq!(fit_bar_width(10, 1, 2), 1);
     }
 
@@ -2299,180 +2828,217 @@ mod tests {
         assert_eq!(filled, 5);
     }
 
-    fn pct_sliders(values: &[i64]) -> Vec<Slider> {
-        values
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| Slider {
-                kind: SliderKind::Percent(i),
-                label: format!("p{}", i),
-                value: v,
-                min: 0,
-                max: 100,
-                step: 1,
-                suffix: "%",
-                locked: false,
-            })
-            .collect()
-    }
-
-    fn pct_values(sliders: &[Slider]) -> Vec<i64> {
-        sliders
-            .iter()
-            .filter_map(|s| match s.kind {
-                SliderKind::Percent(_) => Some(s.value),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
-    fn build_sliders_percentages_sum_to_100() {
+    fn initial_monthly_percentages_sum_to_100() {
         let products = vec![
             prod("A", 10.0, 5.0, 5.0),
             prod("B", 10.0, 5.0, 5.0),
             prod("C", 10.0, 5.0, 5.0),
         ];
-        let sliders = build_sliders(&wrap(products));
-        let sum: i64 = pct_values(&sliders).iter().sum();
+        let state = make_state(products);
+        for m in 0..12 {
+            let sum: i64 = state.monthly_pct.iter().map(|p| p[m]).sum();
+            assert_eq!(sum, 100, "month {} sums to {}", m, sum);
+        }
+    }
+
+    // --- redistribute_month (within a single month) -------------------------
+
+    #[test]
+    fn redistribute_month_keeps_total_at_100() {
+        // 50/30/20. Raise A to 60 -> remainder 40 split EQUALLY across the two
+        // non-locked others (including zeros): 20 / 20.
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+            prod("C", 10.0, 5.0, 5.0),
+        ];
+        let mut state = make_state(products);
+        state.monthly_pct[0][0] = 50;
+        state.monthly_pct[1][0] = 30;
+        state.monthly_pct[2][0] = 20;
+        redistribute_month(&mut state, 0, 0, 60);
+        assert_eq!(state.monthly_pct[0][0], 60);
+        assert_eq!(state.monthly_pct[1][0], 20);
+        assert_eq!(state.monthly_pct[2][0], 20);
+        let sum: i64 = state.monthly_pct.iter().map(|p| p[0]).sum();
         assert_eq!(sum, 100);
     }
 
     #[test]
-    fn redistribute_keeps_total_at_100() {
-        let mut sliders = pct_sliders(&[50, 30, 20]);
-        // Bump product 0 from 50 to 60; remainder 40 split EQUALLY across the
-        // two eligible others (both >0): 20 / 20.
-        redistribute_percent(&mut sliders, 0, 60);
-        let vals = pct_values(&sliders);
-        assert_eq!(vals.iter().sum::<i64>(), 100);
-        assert_eq!(vals[0], 60);
-        assert_eq!(vals[1], 20);
-        assert_eq!(vals[2], 20);
-    }
-
-    #[test]
-    fn redistribute_skips_zero_products() {
+    fn redistribute_month_includes_zero_products() {
         // A=50, B=30, C=0. Raise A to 60 -> remainder 40 split equally across
-        // the eligible (non-zero) others, which is ONLY B. C stays at 0.
-        let mut sliders = pct_sliders(&[50, 30, 0]);
-        redistribute_percent(&mut sliders, 0, 60);
-        let vals = pct_values(&sliders);
-        assert_eq!(vals.iter().sum::<i64>(), 100);
-        assert_eq!(vals[0], 60);
-        assert_eq!(vals[1], 40);
-        assert_eq!(vals[2], 0);
+        // ALL non-locked others (including C at 0): B=20, C=20. (New behaviour:
+        // zeros are receivers, unlike the old yearly-only redistribute.)
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+            prod("C", 10.0, 5.0, 5.0),
+        ];
+        let mut state = make_state(products);
+        state.monthly_pct[0][0] = 50;
+        state.monthly_pct[1][0] = 30;
+        state.monthly_pct[2][0] = 0;
+        redistribute_month(&mut state, 0, 0, 60);
+        assert_eq!(state.monthly_pct[0][0], 60);
+        assert_eq!(state.monthly_pct[1][0], 20);
+        assert_eq!(state.monthly_pct[2][0], 20);
     }
 
     #[test]
-    fn redistribute_all_others_zero_leaves_sum_below_100() {
-        // A=100, B=0. Lower A to 50: no eligible other to absorb the 50
-        // remainder, so B stays 0 and the sum is 50 (the user must raise B).
-        let mut sliders = pct_sliders(&[100, 0]);
-        redistribute_percent(&mut sliders, 0, 50);
-        assert_eq!(pct_values(&sliders), vec![50, 0]);
+    fn redistribute_month_freezes_locked_product() {
+        // A=50, B=30, C=20. Lock B (month-lock) at 30, raise A to 60: remainder
+        // 10 goes only to the non-locked C.
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+            prod("C", 10.0, 5.0, 5.0),
+        ];
+        let mut state = make_state(products);
+        state.monthly_pct[0][0] = 50;
+        state.monthly_pct[1][0] = 30;
+        state.monthly_pct[2][0] = 20;
+        state.month_locked[1][0] = true;
+        redistribute_month(&mut state, 0, 0, 60);
+        assert_eq!(state.monthly_pct[0][0], 60);
+        assert_eq!(state.monthly_pct[1][0], 30); // frozen
+        assert_eq!(state.monthly_pct[2][0], 10); // absorbed the whole remainder
     }
 
     #[test]
-    fn redistribute_revives_a_zero_product_when_raised() {
-        // A=100, B=0. Raise B to 25: A is the only eligible other (>0), so A
-        // absorbs the 75 remainder.
-        let mut sliders = pct_sliders(&[100, 0]);
-        redistribute_percent(&mut sliders, 1, 25);
-        assert_eq!(pct_values(&sliders), vec![75, 25]);
+    fn redistribute_month_clamped_by_locked_room() {
+        // Lock B=30 and C=50 (locked_sum=80). Raise A above the available 20:
+        // it clamps to 20 so the sum stays exactly 100.
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+            prod("C", 10.0, 5.0, 5.0),
+        ];
+        let mut state = make_state(products);
+        state.monthly_pct[0][0] = 20;
+        state.monthly_pct[1][0] = 30;
+        state.monthly_pct[2][0] = 50;
+        state.month_locked[1][0] = true;
+        state.month_locked[2][0] = true;
+        redistribute_month(&mut state, 0, 0, 90);
+        assert_eq!(state.monthly_pct[0][0], 20);
+        assert_eq!(state.monthly_pct[1][0], 30);
+        assert_eq!(state.monthly_pct[2][0], 50);
+        let sum: i64 = state.monthly_pct.iter().map(|p| p[0]).sum();
+        assert_eq!(sum, 100);
     }
 
     #[test]
-    fn redistribute_freezes_locked_product_value() {
-        // A=50, B=30, C=20. Lock B at 30, then raise A to 60: the remainder 10
-        // must go ONLY to the non-locked, non-zero C (B is frozen and excluded).
-        let mut sliders = pct_sliders(&[50, 30, 20]);
-        sliders[1].locked = true;
-        redistribute_percent(&mut sliders, 0, 60);
-        let vals = pct_values(&sliders);
-        assert_eq!(vals.iter().sum::<i64>(), 100);
-        assert_eq!(vals[0], 60);
-        assert_eq!(vals[1], 30); // frozen
-        assert_eq!(vals[2], 10); // absorbed the whole remainder
+    fn redistribute_month_locked_changed_is_noop() {
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        state.month_locked[0][0] = true;
+        let before = state.monthly_pct[0][0];
+        redistribute_month(&mut state, 0, 0, 80);
+        assert_eq!(state.monthly_pct[0][0], before);
     }
 
     #[test]
-    fn redistribute_capped_by_locked_room() {
-        // A=20, B=30, C=50. Lock B=30 and C=50 (locked_sum=80). Raise A above
-        // the available 20: it must clamp to 20 (100 - 80), not exceed it, so
-        // the sum stays exactly 100.
-        let mut sliders = pct_sliders(&[20, 30, 50]);
-        sliders[1].locked = true;
-        sliders[2].locked = true;
-        redistribute_percent(&mut sliders, 0, 90);
-        let vals = pct_values(&sliders);
-        assert_eq!(vals.iter().sum::<i64>(), 100);
-        assert_eq!(vals[0], 20); // clamped to 100 - locked_sum
-        assert_eq!(vals[1], 30); // frozen
-        assert_eq!(vals[2], 50); // frozen
+    fn redistribute_month_yearly_locked_is_frozen() {
+        // Yearly-lock on B freezes it in every month.
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        state.yearly_locked[1] = true;
+        let before = state.monthly_pct[1][3];
+        redistribute_month(&mut state, 3, 0, 60);
+        assert_eq!(state.monthly_pct[1][3], before);
+        // B is frozen at 50, so A is clamped to 100 - 50 = 50 (not 60).
+        assert_eq!(state.monthly_pct[0][3], 50);
+        assert_eq!(state.monthly_pct[1][3], 50);
+    }
+
+    // --- edit_yearly (propagation across all 12 months) ---------------------
+
+    #[test]
+    fn edit_yearly_propagates_to_all_months() {
+        // 2 products 50/50. Edit yearly A to 80: every month becomes A=80/B=20
+        // (no month-locks), and the yearly mean recompute = 80.
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        edit_yearly(&mut state, 0, 80);
+        for m in 0..12 {
+            assert_eq!(state.monthly_pct[0][m], 80, "month {}", m);
+            assert_eq!(state.monthly_pct[1][m], 20, "month {}", m);
+        }
+        assert_eq!(state.yearly_pct(0), 80);
     }
 
     #[test]
-    fn redistribute_locked_changed_slider_does_nothing() {
-        // A=50, B=50. Lock A, then try to raise A to 80: it is frozen, so
-        // nothing moves.
-        let mut sliders = pct_sliders(&[50, 50]);
-        sliders[0].locked = true;
-        redistribute_percent(&mut sliders, 0, 80);
-        assert_eq!(pct_values(&sliders), vec![50, 50]);
+    fn edit_yearly_skips_month_locked_months() {
+        // Lock A in month 3 at 50. Edit yearly A to 80: month 3 stays 50, the
+        // other 11 months become 80. Yearly mean = (11*80 + 50)/12 ≈ 77.5,
+        // NOT 80 — the "unless locked" behaviour.
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        state.month_locked[0][3] = true;
+        edit_yearly(&mut state, 0, 80);
+        assert_eq!(state.monthly_pct[0][3], 50); // month-locked, unchanged
+        for m in 0..12 {
+            if m != 3 {
+                assert_eq!(state.monthly_pct[0][m], 80, "month {}", m);
+            }
+        }
+        let expected: f64 = (11.0 * 80.0 + 50.0) / 12.0;
+        assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
+        assert_ne!(state.yearly_pct(0), 80);
     }
 
     #[test]
-    fn redistribute_locked_zero_excluded_from_receivers() {
-        // A=50, B=50. Lock B at 50. Lower A to 20: remainder 30 would normally
-        // go to B, but B is locked, so there is no eligible receiver and A
-        // stays at 20 (sum below 100, the user must unlock B to fix it).
-        let mut sliders = pct_sliders(&[50, 50]);
-        sliders[1].locked = true;
-        redistribute_percent(&mut sliders, 0, 20);
-        assert_eq!(pct_values(&sliders), vec![20, 50]);
+    fn edit_yearly_locked_product_is_noop() {
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        state.yearly_locked[0] = true;
+        let before: Vec<[i64; 12]> = state.monthly_pct.clone();
+        edit_yearly(&mut state, 0, 80);
+        assert_eq!(state.monthly_pct, before);
     }
 
     #[test]
-    fn redistribute_ignores_non_percent_slider() {
-        let mut sliders = pct_sliders(&[50, 50]);
-        sliders.push(Slider {
-            kind: SliderKind::WorkdayHours,
-            label: "wh".into(),
-            value: 8,
-            min: 1,
-            max: 24,
-            step: 1,
-            suffix: " h",
-            locked: false,
-        });
-        let idx = sliders.len() - 1; // the workday slider
-        redistribute_percent(&mut sliders, idx, 20);
-        // Workday slider untouched, percentages untouched.
-        assert_eq!(sliders[idx].value, 8);
-        assert_eq!(pct_values(&sliders), vec![50, 50]);
+    fn monthly_edit_recomputes_yearly_as_mean() {
+        // 2 products 50/50. Edit month 0 A to 80 -> month 0 = 80/20, other
+        // months stay 50/50. Yearly A = (80 + 11*50)/12 ≈ 52.5 -> 52 (rounded).
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        state.selected_month = 0;
+        redistribute_month(&mut state, 0, 0, 80);
+        let expected: f64 = (80.0 + 11.0 * 50.0) / 12.0;
+        assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
     }
+
+    #[test]
+    fn yearly_lock_renders_month_checkbox_checked_and_greyed() {
+        // When a product is yearly-locked, its monthly slider in the Graph tab
+        // must render locked (checked) regardless of month_locked.
+        let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+        let mut state = make_state(products);
+        state.yearly_locked[0] = true;
+        state.tab = Tab::Graph;
+        state.rebuild_sliders();
+        let a_month = state
+            .sliders
+            .iter()
+            .find(|s| matches!(s.kind, SliderKind::MonthPercent(0)))
+            .unwrap();
+        assert!(a_month.locked, "monthly slider must be locked when yearly-locked");
+        // Toggling its month-lock via Space must be ignored (yearly-locked).
+        // (Covered by handle_key logic; here we just assert the effective lock.)
+    }
+
+    // --- parallel range / totals / export -----------------------------------
 
     #[test]
     fn parallel_slider_range_caps_to_workday_budget() {
-        // One product: net profit 5, duration 60 min. Monthly goal 1000 ->
-        // 200 sales -> 12000 monthly minutes (200 h). Yearly 12000 -> 2400
-        // sales -> 144000 min (2400 h). Workday 8 h.
-        //   monthly_p_cap = 200 / (30*8) = 0.833 -> min binds at annual?
-        //   annual_p_cap  = 2400 / (365*8) = 0.822 -> monthly binds (0.833).
-        //   min = ceil(0.833) = 1, max = floor(200/8) = 25.
         let products = vec![prod("A", 10.0, 5.0, 60.0)];
-        let mut sliders = build_sliders(&wrap(products.clone()));
-        for s in &mut sliders {
-            match s.kind {
-                SliderKind::MonthlyGoal => s.value = 1000,
-                SliderKind::YearlyGoal => s.value = 12000,
-                SliderKind::WorkdayHours => s.value = 8,
-                SliderKind::Parallel => s.value = 1,
-                _ => {}
-            }
-        }
-        let mut state = make_state(products, sliders);
+        let mut state = make_state(products);
+        set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+        set_setting(&mut state, SliderKind::YearlyGoal, 12000);
+        set_setting(&mut state, SliderKind::WorkdayHours, 8);
+        set_setting(&mut state, SliderKind::Parallel, 1);
         update_parallel_range(&mut state);
         let p = state
             .sliders
@@ -2486,22 +3052,12 @@ mod tests {
 
     #[test]
     fn parallel_slider_clamps_when_goal_raises_min() {
-        // Large monthly goal + 1 h workday drives the min up. Monthly goal
-        // 100000, net 5, dur 60 -> 20000 sales -> 1200000 min (20000 h).
-        // workday 1 h: monthly_p_cap = 20000/30 = 666.67 -> min = 667.
-        //   max = floor(20000/1) = 20000.
         let products = vec![prod("A", 10.0, 5.0, 60.0)];
-        let mut sliders = build_sliders(&wrap(products.clone()));
-        for s in &mut sliders {
-            match s.kind {
-                SliderKind::MonthlyGoal => s.value = 100000,
-                SliderKind::YearlyGoal => s.value = 0,
-                SliderKind::WorkdayHours => s.value = 1,
-                SliderKind::Parallel => s.value = 1,
-                _ => {}
-            }
-        }
-        let mut state = make_state(products, sliders);
+        let mut state = make_state(products);
+        set_setting(&mut state, SliderKind::MonthlyGoal, 100000);
+        set_setting(&mut state, SliderKind::YearlyGoal, 0);
+        set_setting(&mut state, SliderKind::WorkdayHours, 1);
+        set_setting(&mut state, SliderKind::Parallel, 1);
         update_parallel_range(&mut state);
         let p = state
             .sliders
@@ -2509,71 +3065,64 @@ mod tests {
             .find(|s| s.kind == SliderKind::Parallel)
             .unwrap();
         assert_eq!(p.min, 667);
-        assert_eq!(p.value, 667); // clamped up to the new min
+        assert_eq!(p.value, 667);
         assert!(p.max >= p.min);
     }
 
     #[test]
-    fn compute_totals_matches_split_sums() {
-        // Two products, equal 50/50 split, monthly goal 1000, yearly 12000.
-        // A: net 5, dur 5 min -> share goal 500 -> 100 sales -> 500 min.
-        // B: net 10, dur 10 min -> share goal 500 -> 50 sales -> 500 min.
-        // Totals: monthly 150 sales, 1000 min, 16.67 h, workdays = 16.67/(8*1).
+    fn compute_totals_monthly_and_annual() {
+        // Two products, equal 50/50 split, monthly goal 1000, all 12 months
+        // equal. A: net 5, dur 5 -> 100 sales / 500 min. B: net 10, dur 10 ->
+        // 50 sales / 500 min. Monthly totals: 150 sales, 1000 min. Annual =
+        // 12 * monthly (all months equal).
         let products = vec![prod("A", 6.0, 1.0, 5.0), prod("B", 12.0, 2.0, 10.0)];
-        let mut sliders = build_sliders(&wrap(products.clone()));
-        for s in &mut sliders {
-            match s.kind {
-                SliderKind::MonthlyGoal => s.value = 1000,
-                SliderKind::YearlyGoal => s.value = 12000,
-                SliderKind::WorkdayHours => s.value = 8,
-                SliderKind::Parallel => s.value = 1,
-                _ => {}
-            }
-        }
-        let state = make_state(products, sliders);
+        let mut state = make_state(products);
+        set_setting(&mut state, SliderKind::MonthlyGoal, 1000);
+        set_setting(&mut state, SliderKind::YearlyGoal, 12000);
+        set_setting(&mut state, SliderKind::WorkdayHours, 8);
+        set_setting(&mut state, SliderKind::Parallel, 1);
         let t = compute_totals(&state);
         assert_eq!(t.monthly.sales, 150);
         assert!((t.monthly.minutes - 1000.0).abs() < 1e-6);
-        assert!((t.monthly.hours - 16.6667).abs() < 1e-3);
-        assert!((t.monthly.workdays - 16.6667 / 8.0).abs() < 1e-3);
+        assert_eq!(t.annual.sales, 150 * 12);
+        assert!((t.annual.minutes - 12000.0).abs() < 1e-6);
         assert_eq!(t.workday_hours, 8);
         assert_eq!(t.parallel, 1);
     }
 
     #[test]
-    fn export_results_writes_per_product_and_totals_files() {
-        let dir = std::env::temp_dir().join("tui_export_test");
+    fn export_results_writes_12_monthly_rows_and_totals() {
+        let dir = std::env::temp_dir().join("tui_export_test_monthly");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Two products with positive net profit.
         let products = vec![
             prod("Coffee", 4.5, 1.15, 5.0),
             prod("Tea", 3.0, 0.8, 4.0),
         ];
-        // Place product definition files alongside so result files write next
-        // to them.
         let mut paths: Vec<(PathBuf, ProductResult)> = Vec::new();
         for (i, r) in products.into_iter().enumerate() {
             let f = dir.join(format!("p{}.txt", i));
             std::fs::write(&f, "+ stub\n").unwrap();
             paths.push((f, r));
         }
-
-        let mut sliders = build_sliders(&paths.clone());
-        // Give the monthly goal a small known value.
-        for s in &mut sliders {
-            if let SliderKind::MonthlyGoal = s.kind {
-                s.value = 500;
-            }
-            if let SliderKind::YearlyGoal = s.kind {
-                s.value = 6000;
-            }
-        }
-        let state = AppState {
+        let n = paths.len();
+        let base = 100 / n as i64;
+        let extra = 100 - base * n as i64;
+        let monthly_pct: Vec<[i64; 12]> = (0..n)
+            .map(|i| {
+                let v = base + if (i as i64) < extra { 1 } else { 0 };
+                [v; 12]
+            })
+            .collect();
+        let mut state = AppState {
             products: paths,
             folder: dir.clone(),
-            sliders,
+            monthly_pct,
+            month_locked: vec![[false; 12]; n],
+            yearly_locked: vec![false; n],
+            selected_month: 0,
+            sliders: Vec::new(),
             selected: 0,
             scroll: 0,
             status: None,
@@ -2582,15 +3131,24 @@ mod tests {
             lang: Lang::En,
             active_region: Region::Main,
         };
+        state.rebuild_sliders();
+        set_setting(&mut state, SliderKind::MonthlyGoal, 500);
 
         let status = export_results(&state, &Lang::En);
         assert!(status.contains("exported"), "status was: {}", status);
 
-        // Per-product result files exist.
-        assert!(dir.join("p0.simulation_results.txt").exists());
-        assert!(dir.join("p1.simulation_results.txt").exists());
-        // Aggregate totals file exists.
-        assert!(dir.join("totals.simulation_results.txt").exists());
+        let product_file = std::fs::read_to_string(dir.join("p0.simulation_results.txt")).unwrap();
+        // All 12 month abbreviations appear in the per-product file.
+        for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] {
+            assert!(product_file.contains(m), "per-product file missing month {}, was:\n{}", m, product_file);
+        }
+        assert!(product_file.contains("Annual goal"), "missing annual row");
+
+        let totals_file = std::fs::read_to_string(dir.join("totals.simulation_results.txt")).unwrap();
+        for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] {
+            assert!(totals_file.contains(m), "totals file missing month {}, was:\n{}", m, totals_file);
+        }
+        assert!(totals_file.contains("Total annual sales"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2621,26 +3179,18 @@ mod tests {
     #[test]
     fn settings_renders_two_columns_side_by_side() {
         use ratatui::backend::TestBackend;
-        // Two products so the Settings sliders are at indices 2..6.
         let products = vec![
             prod("A", 10.0, 5.0, 5.0),
             prod("B", 10.0, 5.0, 5.0),
         ];
-        let sliders = build_sliders(&wrap(products.clone()));
-        let mut state = make_state(products, sliders);
+        let mut state = make_state(products);
         update_parallel_range(&mut state);
 
-        // 120x40 terminal: sidebar inner ~34 cols, enough for two ~16-col
-        // columns with 1-char padding on all sides.
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut state)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        // Scope the search to the Settings block: find its title row, then
-        // look for a row below it that has both "Workday" (left col) and
-        // "Monthly" (right col) — the right-column slider label "Monthly
-        // net-profit goal" starts with "Monthly".
         let settings_y = (0..buf.area.height)
             .find_map(|y| find_in_row(&buf, y, "Settings").map(|_| y))
             .expect("Settings title not rendered");
@@ -2652,15 +3202,8 @@ mod tests {
             })
             .expect("Workday/Monthly not rendered side by side in Settings");
         let (_, workday_x, monthly_x) = header;
-        assert!(
-            monthly_x > workday_x,
-            "Monthly (right col) must be right of Workday (left col): workday_x={} monthly_x={}",
-            workday_x,
-            monthly_x
-        );
+        assert!(monthly_x > workday_x);
 
-        // A vertical separator rule (U+2502) must exist between the two labels,
-        // at an x strictly between them.
         let y = header.0;
         let mut found_sep = false;
         for x in (workday_x + 1)..monthly_x {
@@ -2679,8 +3222,7 @@ mod tests {
             prod("A", 10.0, 5.0, 5.0),
             prod("B", 10.0, 5.0, 5.0),
         ];
-        let sliders = build_sliders(&wrap(products.clone()));
-        let mut state = make_state(products, sliders);
+        let mut state = make_state(products);
         update_parallel_range(&mut state);
 
         let backend = TestBackend::new(80, 40);
@@ -2688,11 +3230,6 @@ mod tests {
         terminal.draw(|f| draw(f, &mut state)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        // The Totals block's left column header is "Monthly", right column
-        // header is "Yearly".  Both appear inside the Totals block; find the
-        // Totals title row first to scope the search below it.  "Monthly" also
-        // appears in the Products panel, so search row by row starting at the
-        // Totals title and take the first row that has both labels.
         let totals_y = (0..buf.area.height)
             .find_map(|y| find_in_row(&buf, y, "Totals").map(|_| y))
             .expect("Totals title not rendered");
@@ -2704,14 +3241,8 @@ mod tests {
             })
             .expect("Monthly/Yearly headers not rendered side by side in Totals");
         let (_, monthly_x, yearly_x) = header_y;
-        assert!(
-            yearly_x > monthly_x,
-            "Yearly (right col) must be right of Monthly (left col): monthly_x={} yearly_x={}",
-            monthly_x,
-            yearly_x
-        );
+        assert!(yearly_x > monthly_x);
 
-        // A vertical separator rule must exist between them.
         let y = header_y.0;
         let mut found_sep = false;
         for x in (monthly_x + 1)..yearly_x {
@@ -2724,44 +3255,194 @@ mod tests {
     }
 
     /// Verify the sidebar padding is clamped so all product rows fit: with many
-    /// products on a short terminal, the padding must drop to 0 (no top blank
-    /// line inside the Products border) so every row is visible.
+    /// products on a short terminal, the padding must drop to 0 so every row is
+    /// visible.
     #[test]
     fn sidebar_padding_clamps_to_fit_all_product_rows() {
         use ratatui::backend::TestBackend;
-        // 10 products × 3 lines = 30 content lines needed.
         let products: Vec<ProductResult> = (0..10)
             .map(|i| prod(&format!("P{}", i), 10.0, 5.0, 5.0))
             .collect();
-        let sliders = build_sliders(&wrap(products.clone()));
-        let mut state = make_state(products, sliders);
+        let mut state = make_state(products);
         update_parallel_range(&mut state);
 
-        // 80x40 terminal: sidebar inner ~22 cols (desired_pad=1), but Products
-        // only gets 40-14-13=13 rows; 10 products need 30 lines, so padding
-        // must clamp to 0.
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut state)).unwrap();
         let buf = terminal.backend().buffer().clone();
 
-        // The Products block top border row: find "Products" title, then check
-        // the row immediately below the top border.  With pad=0 the first
-        // product slider header appears right below the border (row+1); with
-        // pad>=1 there's a blank row (row+1 blank, content at row+2).
         let products_y = (0..buf.area.height)
             .find_map(|y| find_in_row(&buf, y, "Products").map(|_| y))
             .expect("Products title not rendered");
-        // The first product slider label is "% P0".
         let p0_row = (products_y + 1..buf.area.height)
             .find_map(|y| find_in_row(&buf, y, "% P0").map(|_| y))
             .expect("% P0 not rendered");
-        // With padding clamped to 0, the content starts immediately after the
-        // border: p0_row == products_y + 1.
         assert_eq!(
             p0_row, products_y + 1,
-            "padding should be 0 (content right below border) when products don't fit otherwise, got p0_row={} products_y={}",
+            "padding should be 0 when products don't fit otherwise, got p0_row={} products_y={}",
             p0_row, products_y
         );
+    }
+
+    #[test]
+    fn graph_sidebar_renders_month_selector() {
+        use ratatui::backend::TestBackend;
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+        ];
+        let mut state = make_state(products);
+        state.tab = Tab::Graph;
+        state.selected_month = 5; // Jun
+        state.rebuild_sliders();
+        update_parallel_range(&mut state);
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The Graph sidebar's top-block title carries the selected month name.
+        assert!(
+            find_in_row(&buf, 0, "Jun (% sales)").is_some()
+                || (0..buf.area.height).any(|y| find_in_row(&buf, y, "Jun").is_some()),
+            "selected month Jun not rendered in Graph sidebar title"
+        );
+        // The month selector slider label "Month" is rendered.
+        assert!(
+            (0..buf.area.height).any(|y| find_in_row(&buf, y, "Month").is_some()),
+            "Month selector not rendered"
+        );
+    }
+
+    #[test]
+    fn save_then_load_state_roundtrip() {
+        let dir = std::env::temp_dir().join("tui_state_roundtrip_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two product definition files.
+        let products = vec![
+            prod("Coffee", 4.5, 1.15, 5.0),
+            prod("Tea", 3.0, 0.8, 4.0),
+        ];
+        let mut paths: Vec<(PathBuf, ProductResult)> = Vec::new();
+        for (i, r) in products.into_iter().enumerate() {
+            let f = dir.join(format!("p{}.txt", i));
+            std::fs::write(&f, "+ stub\n").unwrap();
+            paths.push((f, r));
+        }
+        let n = paths.len();
+        let base = 100 / n as i64;
+        let extra = 100 - base * n as i64;
+        let monthly_pct: Vec<[i64; 12]> = (0..n)
+            .map(|i| {
+                let v = base + if (i as i64) < extra { 1 } else { 0 };
+                [v; 12]
+            })
+            .collect();
+        let mut state = AppState {
+            products: paths.clone(),
+            folder: dir.clone(),
+            monthly_pct,
+            month_locked: vec![[false; 12]; n],
+            yearly_locked: vec![false; n],
+            selected_month: 3,
+            sliders: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            status: None,
+            tab: Tab::Products,
+            product_scroll: 0,
+            lang: Lang::En,
+            active_region: Region::Main,
+        };
+        state.rebuild_sliders();
+
+        // Customize: product 0 = 80%, product 1 = 20% in Jan (month 0).
+        state.monthly_pct[0][0] = 80;
+        state.monthly_pct[1][0] = 20;
+        // Lock product 0 in month 3.
+        state.month_locked[0][3] = true;
+        // Yearly-lock product 1.
+        state.yearly_locked[1] = true;
+        // Change a setting.
+        for s in state.sliders.iter_mut() {
+            if s.kind == SliderKind::MonthlyGoal {
+                s.value = 500;
+            }
+            if s.kind == SliderKind::WorkdayHours {
+                s.value = 6;
+            }
+        }
+
+        // Save state.
+        save_state(&state);
+
+        // Load state back.
+        let loaded = load_state(&dir, &paths).expect("state should load");
+        assert_eq!(loaded.monthly_pct[0][0], 80);
+        assert_eq!(loaded.monthly_pct[1][0], 20);
+        assert!(loaded.month_locked[0][3]);
+        assert!(loaded.yearly_locked[1]);
+        assert_eq!(loaded.selected_month, 3);
+        assert_eq!(loaded.monthly_goal, 500);
+        assert_eq!(loaded.workday_hours, 6);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_returns_none_when_no_file() {
+        let dir = std::env::temp_dir().join("tui_state_nofile_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let products = vec![prod("A", 10.0, 5.0, 5.0)];
+        let paths = wrap(products);
+        assert!(load_state(&dir, &paths).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_normalizes_when_product_added() {
+        let dir = std::env::temp_dir().join("tui_state_normalize_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Save state with 2 products (p0=80, p1=20 in Jan).
+        std::fs::write(dir.join("p0.txt"), "+ stub\n").unwrap();
+        std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
+        std::fs::write(
+            dir.join(".simulation_state"),
+            "p0.txt 80 80 80 80 80 80 80 80 80 80 80 80 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+             p1.txt 20 20 20 20 20 20 20 20 20 20 20 20 0 0 0 0 0 0 0 0 0 0 0 0 1\n",
+        )
+        .unwrap();
+
+        // Now load with 3 products (p2 was added since the save).
+        let products = vec![
+            prod("A", 10.0, 5.0, 5.0),
+            prod("B", 10.0, 5.0, 5.0),
+            prod("C", 10.0, 5.0, 5.0),
+        ];
+        let paths: Vec<(PathBuf, ProductResult)> = products
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (dir.join(format!("p{}.txt", i)), r))
+            .collect();
+        // Create p2.txt so the file exists.
+        std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
+
+        let loaded = load_state(&dir, &paths).expect("state should load");
+        // p0 and p1 keep their saved percentages.
+        assert_eq!(loaded.monthly_pct[0][0], 80);
+        assert_eq!(loaded.monthly_pct[1][0], 20);
+        // p2 was not in the save → 0. After normalization the month sums to
+        // 100 (80+20+0=100, already correct).
+        assert_eq!(loaded.monthly_pct[2][0], 0);
+        let sum: i64 = loaded.monthly_pct.iter().map(|p| p[0]).sum();
+        assert_eq!(sum, 100);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

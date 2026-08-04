@@ -321,6 +321,221 @@ pub(crate) fn write_totals_file(
     fs::write(out_path, output)
 }
 
+/// Month abbreviations used in the per-month export rows. Delegates to the
+/// language's localized month names.
+pub(crate) fn months_abbr(lang: &Lang) -> [&'static str; 12] {
+    lang.months_abbr()
+}
+
+/// Write a per-product `*.simulation_results.txt` with a **12-month breakdown**.
+///
+/// Like [`write_result_file`] but, instead of a single "monthly" row, writes one
+/// row per month (Jan..Dec) using [`Dict::result_month_row`], followed by the
+/// annual goal / time (annual = sum of the 12 months).  Each month's goal,
+/// sales and minutes are provided as 12-element arrays.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_result_file_monthly(
+    file_path: &Path,
+    result: &ProductResult,
+    monthly_goals: &[f64; 12],
+    monthly_sales: &[i64; 12],
+    monthly_minutes: &[f64; 12],
+    annual_goal: f64,
+    annual_sales: i64,
+    annual_minutes: f64,
+    workday_hours: i64,
+    parallel_products: i64,
+    lang: &Lang,
+) -> io::Result<()> {
+    let out_path = result_file_path(file_path);
+    let d = lang.dict();
+    let cur = result.currency;
+    let cur_s = cur.to_string();
+
+    // Stats block (same six rows as the single-month variant).
+    let stats_templates = [
+        d.result_product,
+        d.result_sale_price,
+        d.result_total_cost,
+        d.result_net_profit_unit,
+        d.result_profit_margin,
+        d.result_prod_time,
+    ];
+    let stats_rows: Vec<Vec<String>> = vec![
+        vec![result.name.clone()],
+        vec![format!("{:.2}", result.price), cur_s.clone()],
+        vec![format!("{:.2}", result.total_cost), cur_s.clone()],
+        vec![format!("{:.2}", result.net_profit), cur_s.clone()],
+        vec![format!("{:.2}", result.profit_percent)],
+        vec![format!("{:.2}", result.duration_minutes)],
+    ];
+    let all_templates = [
+        d.result_product,
+        d.result_sale_price,
+        d.result_total_cost,
+        d.result_net_profit_unit,
+        d.result_profit_margin,
+        d.result_prod_time,
+        d.result_annual_goal,
+        d.result_annual_time,
+        d.result_workday,
+        d.result_parallel,
+    ];
+    let label_w = all_templates
+        .iter()
+        .map(|t| lang::str_width(lang::prefix_before_value(t)))
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    let mut lines: Vec<String> = Vec::new();
+    for (t, r) in stats_templates.iter().zip(stats_rows.iter()) {
+        let refs: Vec<&str> = r.iter().map(String::as_str).collect();
+        lines.push(lang::fmt_aligned(t, &refs, label_w));
+    }
+    lines.push(String::new());
+
+    // 12 monthly rows.
+    for m in 0..12 {
+        let hours = monthly_minutes[m] / 60.0;
+        let prefix = format!("  📆 {}:", months_abbr(lang)[m]);
+        lines.push(lang::fmt_prefixed(
+            d.result_month_row,
+            &prefix,
+            &[
+                &format!("{:.2}", monthly_goals[m]),
+                &cur_s,
+                &monthly_sales[m].to_string(),
+                &format!("{:.2}", monthly_minutes[m]),
+                &format!("{:.2}", hours),
+            ],
+            label_w,
+        ));
+    }
+    lines.push(String::new());
+
+    // Annual goal + time (annual = sum of the 12 months).
+    lines.push(lang::fmt_aligned(
+        d.result_annual_goal,
+        &[&format!("{:.2}", annual_goal), &cur_s, &annual_sales.to_string()],
+        label_w,
+    ));
+    lines.push(time_line(
+        d.result_annual_time,
+        annual_minutes,
+        parallel_products,
+        workday_hours,
+        label_w,
+    ));
+    lines.push(String::new());
+    lines.push(lang::fmt_aligned(d.result_workday, &[&workday_hours.to_string()], label_w));
+    lines.push(lang::fmt_aligned(
+        d.result_parallel,
+        &[&parallel_products.to_string()],
+        label_w,
+    ));
+
+    let mut output = lines.join("\n");
+    output.push('\n');
+    fs::write(out_path, output)
+}
+
+/// Write the aggregate `totals.simulation_results.txt` with a **12-month
+/// breakdown**: one row per month (Jan..Dec) using [`Dict::total_month_row`],
+/// followed by the annual total row.  Mirrors [`write_totals_file`] but for
+/// the per-month model.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_totals_file_monthly(
+    folder: &Path,
+    num_products: usize,
+    monthly_sales: &[i64; 12],
+    monthly_minutes: &[f64; 12],
+    total_annual_sales: i64,
+    total_annual_minutes: f64,
+    workday_hours: i64,
+    parallel_products: i64,
+    lang: &Lang,
+) -> io::Result<()> {
+    let d = lang.dict();
+    let out_path = totals_file_path(folder);
+
+    let label_w = [d.total_annual_sales, d.result_workday, d.result_parallel]
+        .iter()
+        .map(|t| lang::str_width(lang::prefix_before_value(t)))
+        .max()
+        .unwrap_or(0)
+        + 2;
+
+    // Compute column widths across the 12 month rows for right-alignment.
+    let month_vals: Vec<[String; 3]> = (0..12)
+        .map(|m| {
+            [
+                monthly_sales[m].to_string(),
+                format!("{:.2}", monthly_minutes[m]),
+                format!("{:.2}", monthly_minutes[m] / 60.0),
+            ]
+        })
+        .collect();
+    let cw = [
+        month_vals.iter().map(|r| lang::str_width(&r[0])).max().unwrap_or(0),
+        month_vals.iter().map(|r| lang::str_width(&r[1])).max().unwrap_or(0),
+        month_vals.iter().map(|r| lang::str_width(&r[2])).max().unwrap_or(0),
+    ];
+
+    let mut output = String::new();
+    output.push_str(&lang::fmt(d.totals_header, &[&num_products.to_string()]));
+    output.push('\n');
+
+    // 12 monthly rows with the month abbreviation right next to the 📆 emoji.
+    for m in 0..12 {
+        let prefix = format!("  📆 {}:", months_abbr(lang)[m]);
+        let padded: Vec<String> = (0..3)
+            .map(|i| lang::pad_left(&month_vals[m][i], cw[i]))
+            .collect();
+        let refs: Vec<&str> = padded.iter().map(String::as_str).collect();
+        output.push_str(&lang::fmt_prefixed(
+            d.total_month_row,
+            &prefix,
+            &refs,
+            label_w,
+        ));
+        output.push('\n');
+    }
+
+    // Annual total row.
+    let annual_row: Vec<String> = vec![
+        total_annual_sales.to_string(),
+        format!("{:.2}", total_annual_minutes),
+        format!("{:.2}", total_annual_minutes / 60.0),
+        parallel_products.to_string(),
+        workday_hours.to_string(),
+        format!(
+            "{:.2}",
+            (total_annual_minutes / 60.0) / (workday_hours as f64 * parallel_products.max(1) as f64)
+        ),
+    ];
+    let annual_refs: Vec<&str> = annual_row.iter().map(String::as_str).collect();
+    output.push_str(&lang::fmt_aligned(
+        d.total_annual_sales,
+        &annual_refs,
+        label_w,
+    ));
+    output.push('\n');
+    output.push_str(&lang::fmt_aligned(
+        d.result_workday,
+        &[&workday_hours.to_string()],
+        label_w,
+    ));
+    output.push('\n');
+    output.push_str(&lang::fmt_aligned(
+        d.result_parallel,
+        &[&parallel_products.to_string()],
+        label_w,
+    ));
+    output.push('\n');
+    fs::write(out_path, output)
+}
+
 /// Read the `*.simulation_results.txt` file for `file_path` and return a one-line
 /// summary string, or `None` if no result file exists. The summary is rendered
 /// in `lang` and the file is parsed using the same language's anchors.
@@ -350,7 +565,8 @@ pub fn get_result_summary(file_path: &Path, lang: &Lang) -> Option<String> {
     for line in content.lines() {
         if line.contains(sale_price_anchor) && currency.is_empty() {
             for tok in line.split_whitespace() {
-                if matches!(tok, "USD" | "EUR" | "CAD") {
+                // Any 3-letter uppercase token is a currency code.
+                if tok.len() == 3 && tok.bytes().all(|b| b.is_ascii_uppercase()) {
                     currency = tok.to_string();
                     break;
                 }
@@ -1109,12 +1325,12 @@ mod tests {
         let product = ProductDefinition {
             name: "X".into(),
             sale_price: 10.0,
-            sale_currency: Currency::USD,
+            sale_currency: Currency::new("USD"),
             production_time: 1.5,
             production_time_unit: TimeUnit::Hours,
             costs: vec![
-                Cost { price: 2.0, currency: Currency::USD, description: "a".into() },
-                Cost { price: 3.0, currency: Currency::USD, description: "b".into() },
+                Cost { price: 2.0, currency: Currency::new("USD"), description: "a".into() },
+                Cost { price: 3.0, currency: Currency::new("USD"), description: "b".into() },
             ],
         };
         let r = compute_result(&product);
@@ -1122,7 +1338,7 @@ mod tests {
         assert!((r.net_profit - 5.0).abs() < 1e-9);
         assert!((r.profit_percent - 50.0).abs() < 1e-9);
         assert!((r.duration_minutes - 90.0).abs() < 1e-9);
-        assert_eq!(r.currency, Currency::USD);
+        assert_eq!(r.currency, Currency::new("USD"));
     }
 
     #[test]
@@ -1134,12 +1350,12 @@ mod tests {
         let product = ProductDefinition {
             name: "Coffee".into(),
             sale_price: 4.5,
-            sale_currency: Currency::USD,
+            sale_currency: Currency::new("USD"),
             production_time: 5.0,
             production_time_unit: TimeUnit::Mins,
             costs: vec![Cost {
                 price: 1.15,
-                currency: Currency::USD,
+                currency: Currency::new("USD"),
                 description: "beans".into(),
             }],
         };
@@ -1176,12 +1392,12 @@ mod tests {
         let product = ProductDefinition {
             name: "Coffee".into(),
             sale_price: 4.5,
-            sale_currency: Currency::USD,
+            sale_currency: Currency::new("USD"),
             production_time: 5.0,
             production_time_unit: TimeUnit::Mins,
             costs: vec![Cost {
                 price: 1.15,
-                currency: Currency::USD,
+                currency: Currency::new("USD"),
                 description: "beans".into(),
             }],
         };
@@ -1267,8 +1483,8 @@ mod tests {
 
     #[test]
     fn compute_product_shares_normalizes_to_100_percent() {
-        let a = make_result("A", 6.0, 5.0, Currency::USD);
-        let b = make_result("B", 5.0, 10.0, Currency::USD);
+        let a = make_result("A", 6.0, 5.0, Currency::new("USD"));
+        let b = make_result("B", 5.0, 10.0, Currency::new("USD"));
         let results: Vec<&ProductResult> = vec![&a, &b];
 
         // Raw rolls 70 / 30 -> normalized 0.7 / 0.3.
@@ -1302,8 +1518,8 @@ mod tests {
 
     #[test]
     fn compute_product_shares_handles_extreme_rolls_and_zero_goal() {
-        let a = make_result("A", 10.0, 1.0, Currency::USD);
-        let b = make_result("B", 10.0, 1.0, Currency::USD);
+        let a = make_result("A", 10.0, 1.0, Currency::new("USD"));
+        let b = make_result("B", 10.0, 1.0, Currency::new("USD"));
         let results: Vec<&ProductResult> = vec![&a, &b];
 
         // Extremes of the allowed range: 1 and 70.
@@ -1322,7 +1538,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "same length")]
     fn compute_product_shares_panics_on_length_mismatch() {
-        let a = make_result("A", 10.0, 1.0, Currency::USD);
+        let a = make_result("A", 10.0, 1.0, Currency::new("USD"));
         let results: Vec<&ProductResult> = vec![&a];
         let _ = compute_product_shares(&results, &[1, 2], 100.0, 0.0);
     }
@@ -1376,14 +1592,14 @@ mod tests {
     fn print_product_stats_aligns_value_column() {
         // Two products whose labels have very different widths; their value
         // columns must start at the same byte offset.
-        let r1 = make_result("Cerveza", 2.01, 0.2, Currency::USD);
+        let r1 = make_result("Cerveza", 2.01, 0.2, Currency::new("USD"));
         let r1 = ProductResult {
             price: 2.7,
             total_cost: 0.69,
             profit_percent: 74.44,
             ..r1
         };
-        let r2 = make_result("American burger", 10.88, 12.0, Currency::USD);
+        let r2 = make_result("American burger", 10.88, 12.0, Currency::new("USD"));
         let r2 = ProductResult {
             price: 16.0,
             total_cost: 5.12,

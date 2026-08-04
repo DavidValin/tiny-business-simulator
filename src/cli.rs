@@ -24,13 +24,14 @@ use std::path::{Path, PathBuf};
 use lang::Lang;
 use parser::{parse_content, ProductDefinition};
 
-fn usage(prog: &str, lang: &Lang) {
+fn print_help(prog: &str, lang: &Lang) {
     let d = lang.dict();
-    eprintln!("\ntiny-business-simulator {} - https://crates.io/crates/tiny-business-simulator\n", env!("CARGO_PKG_VERSION"));
-    eprintln!(" {}", d.usage_label);
-    eprintln!(" {}", lang::fmt(d.usage_interactive, &[prog]));
-    eprintln!(" {}", lang::fmt(d.usage_list, &[prog]));
-    eprintln!(" {}\n", lang::fmt(d.usage_lang, &[prog]));
+    println!("\ntiny-business-simulator {} - https://crates.io/crates/tiny-business-simulator", env!("CARGO_PKG_VERSION"));
+    println!("by David Valin <hola@davidvalin.com> - www.davidvalin.com\n");
+    println!(" {}", d.usage_label);
+    println!(" {}", lang::fmt(d.usage_interactive, &[prog]));
+    println!(" {}", lang::fmt(d.usage_list, &[prog]));
+    println!(" {}\n", lang::fmt(d.usage_lang, &[prog]));
 }
 
 fn print_all_products(folder: &Path, lang: &Lang) {
@@ -90,18 +91,14 @@ fn main() {
     while i < args.len() {
         let a = &args[i];
         if a == "-h" || a == "--help" {
-            println!(
-                "\ntiny-business-simulator {} - https://crates.io/crates/tiny-business-simulator",
-                env!("CARGO_PKG_VERSION")
-            );
-            println!("by David Valin <hola@davidvalin.com> - www.davidvalin.com\n");
+            print_help(prog, &Lang::DEFAULT);
             std::process::exit(0);
         } else if a == "--list" {
             list_mode = true;
         } else if a == "--lang" {
             if i + 1 >= args.len() {
                 eprintln!("{}", lang::fmt(lang::EN.unknown_lang, &[""]));
-                usage(prog, &Lang::En);
+                print_help(prog, &Lang::En);
                 std::process::exit(1);
             }
             lang_code = Some(args[i + 1].clone());
@@ -128,7 +125,7 @@ fn main() {
     let folder = match folder {
         Some(f) => f,
         None => {
-            usage(prog, &lang);
+            print_help(prog, &lang);
             std::process::exit(1);
         }
     };

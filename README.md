@@ -1,6 +1,8 @@
 
 ## Tiny Business Simulator
 
+![preview](https://github.com/DavidValin/tiny-business-simulator/raw/master/preview.gif)
+
 Simulate your next business simply by defining a .txt file for each product in which you define sale prices and costs.
 
 **Example**
@@ -11,16 +13,44 @@ Simulate your next business simply by defining a .txt file for each product in w
   - 0.10 USD cleaning costs
 ```
 
-![preview](https://github.com/DavidValin/tiny-business-simulator/raw/master/preview.gif)
-
 #### Features
 
 Simulate by the next business goals:
 
-  * `monthly net profit`
-  * `yearly net profit`
-  * `parallel products/services` that can be delivered
-  * `workweek hours`
+  * the `monthly net profit` goal
+  * the `yearly net profit` goal
+  * the `parallel products/services` that can be delivered
+  * the `workday hours` (the amount of hours a day the business operates)
+
+The simulator targets a **net-profit** goal (income minus costs), not revenue.
+Each month, the monthly goal is split across products by their sales-% share,
+giving a required sales count per product:
+
+```
+required_sales = ceil(share * monthly_goal / net_profit_per_unit)
+```
+
+The yearly goal is a **reference target** shown next to the 12 × monthly sum;
+the yearly total is the **sum** of the 12 monthly results, so the yearly goal is
+only a reference.
+
+`workday hours` and `parallel products` define a monthly production **capacity**
+in minutes:
+
+```
+capacity_minutes = workday_hours * 22 workdays * 60 * parallel
+```
+
+If the required production minutes exceed capacity, sales are scaled down to fit
+(the goal cannot be fully met that month). The `parallel products` range is
+automatically enforced so the financial goals stay reachable; the slider's own
+min/max is recomputed on every change.
+
+The `workdays` figure shown in the results is:
+
+```
+workdays = required_hours / (workday_hours * parallel)
+```
 
 Obtain simulation results (per product and totals) to meet your business goals:
 
@@ -33,40 +63,50 @@ Obtain simulation results (per product and totals) to meet your business goals:
 
 Yearly barchart graph with sales number and (sales amount - profit amount) per month
 
-It automatically enforces 'parallel products' range to meet the financial goals.
+##### Monthly / yearly sales distribution %
 
-##### Per-month sales distribution
+Each month's goal is divided between products using percentages. Every month
+column always sums to exactly 100%.
 
-Customize the percentage of sales per product for each month of the year, so the
-simulation reflects seasonal demand (e.g. beer sells more in summer, hot
-chocolate in winter).  The distribution is controlled from the **Graph** tab:
+  * **Graph tab**: a **Month selector** picks the month (Jan..Dec). Each
+    product has a **monthly-% slider**. Editing it sets that product's % and
+    redistributes the remainder **equally** across all other non-locked
+    products in that month.
+  * **Products tab**: each product shows a **yearly-% slider** (the mean of its
+    12 monthly values). Editing it propagates the target to every month where
+    the product isn't month-locked, redistributing within each month.
 
-  * A **Month selector** at the top of the sidebar lets you pick which month to
-    edit (January by default).
-  * Below it, every product shows a **percentage slider** and a **lock
-    checkbox**.  The remaining percentage is redistributed equally across all
-    non-locked products in that month.
-  * The **Products** tab shows a **yearly percentage** per product (the mean of
-    the 12 monthly values).  Editing the yearly percentage propagates the
-    target to every month where the product isn't month-locked.
+The chart draws 12 separate monthly columns, so the mix can vary per month
+(seasonal demand — e.g. beer sells more in summer, hot chocolate in winter).
+The yearly total is the **sum** of the 12 months.
 
-Two levels of locking:
+###### Locks
 
-  * **Yearly lock** (Products tab): freezes the product's percentage in all 12
-    months (the month checkboxes render checked and greyed out).
-  * **Month lock** (Graph tab): freezes the product's percentage only for the
-    selected month.
+Locks freeze a product's percentage so it is excluded from redistribution.
 
-The chart renders 12 distinct monthly columns (each month's mix may differ) and
-the yearly total is the **sum** of the 12 months.
+  * **Yearly lock** (Products tab, `Space` on a yearly slider): freezes the
+    product in **all 12 months**. Month checkboxes render checked and greyed
+    out.
+  * **Month lock** (Graph tab, `Space` on a monthly slider): freezes the
+    product only for the selected month (disabled if the product is
+    yearly-locked).
 
-##### State persistence
+Locked products keep their fixed share of the 100% pie; the remaining
+percentage is split among the unlocked products.
+
+##### Exports & state
 
 Pressing `Control+E` exports the simulation to files **and** saves the current
-percentages, locks, and settings to a hidden `.simulation_state` file in the
-product folder.  Reopening the app restores the saved distribution.  If
-products were added or removed since the save, each month's percentages are
-re-normalized to sum to 100.
+percentages, locks, and settings:
+
+  * one `<product>.simulation_results.txt` per product (stats + 12 monthly rows
+    + annual row + workday/parallel)
+  * a `totals.simulation_results.txt` aggregating all products
+  * a hidden `.simulation_state` file in the product folder saving percentages,
+    locks, and settings
+
+Reopening the app restores the saved distribution.  If products were added or
+removed since the save, each month's percentages are re-normalized to sum to 100.
 
 ##### Interface language
 
@@ -89,13 +129,18 @@ Set the interface language with `--lang <code>` (default `en`):
     on the Graph tab's month selector)
   * `Space` — toggle the lock checkbox of the focused product slider
   * `Control+E` — export the simulation per product and the totals to files
+  * `Control+H` — full-screen help on how the simulator works
   * `q` / `Esc` — quit
 
 #### Quickstart
 
-```
-make
-./tiny-business-simulator sample_business
+```bash
+# Install
+make build
+sudo make install
+
+# Run
+tiny-business-simulator sample_business
 ```
 
 #### Define a business with products/services
@@ -115,6 +160,8 @@ For each product create a .txt file defining:
 * define as many line costs as you need to produce and deliver such product
 * supported currencies: any 3-letter ISO 4217 code (e.g. `USD`, `EUR`, `GBP`, `JPY`, `CAD`, `MXN`, `CNY`)
 * supported production-time units: `mins`, `hours`
+* products whose net profit (price - total cost) is zero or negative are skipped
+* files matching `*.simulation_results.txt` and the hidden `.simulation_state` are ignored by the loader
 
 Example of a product (`./sample_business/beer.txt`):
 

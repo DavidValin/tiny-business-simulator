@@ -21,6 +21,7 @@
 // -----
 //   Up/Down    move focus between sidebar sliders
 //   Left/Right decrement / increment the focused slider by its step
+//   Ctrl+H     full-screen help overlay
 //   q / Esc    quit
 //
 // Simulation model
@@ -215,6 +216,10 @@ struct AppState {
     lang: Lang,
     /// Which region (main content vs sidebar) currently receives Up/Down.
     active_region: Region,
+    /// Whether the full-screen help overlay (Ctrl+H) is currently shown.
+    show_help: bool,
+    /// Top visible line index of the help overlay's scrollable text.
+    help_scroll: usize,
 }
 
 impl AppState {
@@ -367,8 +372,11 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let mt = &months[sel];
     let d = state.lang.dict();
     let mnames = state.lang.months_abbr();
+    // The stats line (axis max + selected-month + yearly figures) is rendered
+    // below the legend, as the first line inside the bordered region, so it is
+    // easy to read instead of being crammed into the title next to the legend.
     let stats = format!(
-        "  |   {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})   {7}: n={8} \u{00a4}={9:.0} ({10} {11:.0})",
+        "  {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})   {7}: n={8} \u{00a4}={9:.0} ({10} {11:.0})",
         d.tui_axis_max, max_with_headroom,
         mnames[sel], mt.units, mt.amount, d.tui_profit, mt.profit,
         d.tui_yearly, yearly_units, yearly_amount, d.tui_profit, yearly_profit,
@@ -388,7 +396,6 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         Span::styled(d.tui_legend_units, Style::default().fg(Color::Cyan).add_modifier(bold)),
         Span::styled(d.tui_legend_profit, Style::default().fg(Color::Green).add_modifier(bold)),
         Span::styled(d.tui_legend_cost, Style::default().fg(Color::Yellow).add_modifier(bold)),
-        Span::raw(stats),
     ]);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -398,16 +405,26 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     frame.render_widget(block, area);
     let buf = frame.buffer_mut();
 
-    // Axis-max label at the top-left of the inner area.
+    // Stats line: first row inside the bordered region, right below the legend.
+    let stats_rows: u16 = 1;
+    if inner.height >= stats_rows {
+        buf.set_string(
+            inner.x,
+            inner.y,
+            &stats,
+            Style::default().fg(Color::White),
+        );
+    }
+
+    // Axis-max label at the top-left of the chart area (just below the stats).
+    let chart_top = inner.y + stats_rows;
     let axis_label = format!("\u{2191} {} {:.0}", d.tui_max, max_with_headroom);
-    let axis_w = axis_label.chars().count().min(inner.width as usize) as u16;
     buf.set_string(
         inner.x,
-        inner.y,
+        chart_top,
         &axis_label,
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     );
-    let _ = axis_w;
 
     let bar_gap: u16 = 1;
     let group_gap: u16 = 2;
@@ -421,13 +438,14 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         (12u32 * group_width as u32 + 11 * group_gap as u32) as u16;
     let chart_x = inner.x + chart_margin + avail_width.saturating_sub(total_chart_width) / 2;
 
-    // Reserve 2 rows at the bottom for the bar labels (n/$) and month labels.
+    // Reserve 2 rows at the bottom for the bar labels (n/$) and month labels,
+    // and `stats_rows` at the top for the stats line.
     let label_rows: u16 = 2;
-    let bar_h = inner.height.saturating_sub(label_rows);
+    let bar_h = inner.height.saturating_sub(label_rows).saturating_sub(stats_rows);
     if bar_h == 0 {
         return;
     }
-    let bar_bottom = inner.y + bar_h - 1;
+    let bar_bottom = chart_top + bar_h - 1;
 
     let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
     let yellow = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
@@ -1447,6 +1465,11 @@ fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'stat
 }
 
 fn draw(frame: &mut ratatui::Frame, state: &mut AppState) {
+    // Ctrl+H help overlay takes over the whole screen when active.
+    if state.show_help {
+        render_help(frame, frame.area(), state);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(1)])
@@ -1862,7 +1885,134 @@ fn edit_yearly(state: &mut AppState, changed_prod: usize, target_value: i64) {
     }
 }
 
+/// Build the styled line list for the help overlay. Lines starting with
+/// `## ` are section headers (rendered bold + yellow, preceded by a blank
+/// line); everything else is body text wrapped by the `Paragraph` widget.
+fn build_help_lines(state: &AppState) -> Vec<Line<'static>> {
+    let header_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let text = state.lang.dict().tui_help_text;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for raw in text.split('\n') {
+        if let Some(rest) = raw.strip_prefix("## ") {
+            if !out.is_empty() {
+                out.push(Line::default());
+            }
+            out.push(Line::styled(rest.to_string(), header_style));
+        } else {
+            out.push(Line::from(raw.to_string()));
+        }
+    }
+    out
+}
+
+/// Page-up / page-down step for the help overlay, derived from the current
+/// terminal height (inner area, borders excluded).
+fn help_page_size() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, h)| (h.saturating_sub(2)) as usize)
+        .unwrap_or(10)
+        .max(1)
+}
+
+/// Render the full-screen help overlay (Ctrl+H). Clears the normal layout
+/// and fills the whole terminal with a bordered, scrollable `Paragraph`.
+fn render_help(frame: &mut ratatui::Frame, area: Rect, state: &mut AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(state.lang.dict().tui_help_title)
+        .title_style(Style::default().add_modifier(Modifier::BOLD))
+        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let lines = build_help_lines(state);
+    let total = lines.len();
+    let visible = inner.height as usize;
+    // Clamp the scroll offset to the valid range, leaving the last page full
+    // when possible.
+    if total <= visible {
+        state.help_scroll = 0;
+    } else if state.help_scroll > total - visible {
+        state.help_scroll = total - visible;
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.help_scroll as u16, 0)),
+        inner,
+    );
+
+    // Scroll indicators on the right edge.
+    let can_up = state.help_scroll > 0;
+    let can_down = total > visible && state.help_scroll + visible < total;
+    let arrow_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    if inner.width >= 1 && inner.height >= 1 {
+        let right_col = inner.x + inner.width.saturating_sub(1);
+        if can_up {
+            frame.render_widget(
+                Paragraph::new("\u{2191}").style(arrow_style),
+                Rect::new(right_col, inner.y, 1, 1),
+            );
+        }
+        if can_down {
+            frame.render_widget(
+                Paragraph::new("\u{2193}").style(arrow_style),
+                Rect::new(
+                    right_col,
+                    inner.y + inner.height.saturating_sub(1),
+                    1,
+                    1,
+                ),
+            );
+        }
+    }
+}
+
 fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
+    // Ctrl+H: toggle the full-screen help overlay. While the overlay is open
+    // it swallows all keys: Esc/q/Ctrl+H close it, arrows scroll the text,
+    // everything else is ignored (so the underlying layout is not disturbed).
+    if key.modifiers.contains(event::KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+        state.show_help = !state.show_help;
+        state.help_scroll = 0;
+        return false;
+    }
+    if state.show_help {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                state.show_help = false;
+                state.help_scroll = 0;
+            }
+            KeyCode::Up => {
+                if state.help_scroll > 0 {
+                    state.help_scroll -= 1;
+                }
+            }
+            KeyCode::Down => {
+                state.help_scroll = state.help_scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                let page = help_page_size();
+                state.help_scroll = state.help_scroll.saturating_sub(page);
+            }
+            KeyCode::PageDown => {
+                let page = help_page_size();
+                state.help_scroll = state.help_scroll.saturating_add(page);
+            }
+            KeyCode::Home => state.help_scroll = 0,
+            KeyCode::End => state.help_scroll = usize::MAX,
+            _ => {}
+        }
+        return false;
+    }
     // Ctrl+E: export current simulation to the *.simulation_results.txt files.
     if key.modifiers.contains(event::KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         state.status = Some(export_results(state, lang));
@@ -2579,6 +2729,8 @@ pub fn run(folder: &Path, lang: &Lang) {
         product_scroll: 0,
         lang: *lang,
         active_region: Region::Main,
+        show_help: false,
+        help_scroll: 0,
     };
     // Apply loaded settings (workday, parallel, goals) if present.
     if let Some(l) = &loaded {
@@ -2691,6 +2843,8 @@ mod tests {
             product_scroll: 0,
             lang: Lang::En,
             active_region: Region::Main,
+            show_help: false,
+            help_scroll: 0,
         };
         state.rebuild_sliders();
         state
@@ -3144,6 +3298,8 @@ mod tests {
             product_scroll: 0,
             lang: Lang::En,
             active_region: Region::Main,
+            show_help: false,
+            help_scroll: 0,
         };
         state.rebuild_sliders();
         set_setting(&mut state, SliderKind::MonthlyGoal, 500);
@@ -3368,6 +3524,8 @@ mod tests {
             status: None,
             tab: Tab::Products,
             product_scroll: 0,
+            show_help: false,
+            help_scroll: 0,
             lang: Lang::En,
             active_region: Region::Main,
         };

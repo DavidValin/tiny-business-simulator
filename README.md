@@ -75,7 +75,7 @@ sidebar changes accordingly:
     * `target yearly net profit` (default 500, a reference shown next to the
       12 × monthly sum)
   * **A month** — three *override* sliders: `workday hours`,
-    `parallel products`, and `net profit` for that month. Each override must be
+    `parallel products`, and `net profit target` for that month. Each override must be
     **at least** its global minimum and replaces the minimum for that month
     only.
 
@@ -84,6 +84,39 @@ the per-month value (the override when set, otherwise the global `min. monthly
 net profit`). Workday hours and parallel products are likewise per-month values
 floored by their global minimums. The yearly total is the **sum** of the 12
 monthly results, so the `target yearly net profit` slider is only a reference.
+
+### Sidebar totals
+
+The bottom of the sidebar shows **achievable (capacity-capped)** totals that
+always match the chart. The layout depends on the selected period:
+
+  * **Full Year** — left column = `Yearly` totals; right column = `Yearly ref`.
+  * **A month** — left column = `Monthly` totals (plus a goal-achievement line);
+    right column = `Yearly` totals + `Yearly ref`.
+
+Each period block (`Monthly` / `Yearly`) shows four rows:
+
+  * `sales` — total units sold (after capacity capping).
+  * `minutes` — achieved production minutes (capped units × product production
+    time).
+  * `hours` — `minutes / 60`.
+  * `workdays` — `hours / (workday_hours * parallel)`. The annual `workdays`
+    sum each month using that month's own `workday hours` / `parallel` override.
+
+For a selected month, an extra line at the end of the `Monthly` block shows
+whether the month's net-profit goal was reached: a green ✔ if the month's
+achieved net profit ≥ the month's goal, a red ✖ otherwise, followed by the goal
+value.
+
+The `Yearly ref` block compares the sum of the 12 monthly net-profit goals
+against the `target yearly net profit`:
+
+  * `12x mo` — sum of the 12 monthly net-profit goals (each month's override,
+    else the global `min. monthly net profit`).
+  * ✔ / ✖ + `goal` — green ✔ if that sum meets the `target yearly net profit`,
+    red ✖ otherwise, followed by the target value. The `target yearly net
+    profit` is only a reference; the yearly total is the **sum** of the 12
+    monthly results.
 
 ### Monthly / yearly sales distribution %
 

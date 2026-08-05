@@ -1921,10 +1921,26 @@ fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'stat
     };
 
     // --- Left column: period totals ---
-    //   Month period  -> Monthly
+    //   Month period  -> Monthly (+ goal-achievement indicator)
     //   Full Year     -> Yearly
     let mut left: Vec<Line<'static>> = match state.period {
-        Period::Month(_) => period_block(d.tui_label_monthly, &t.monthly),
+        Period::Month(m) => {
+            let mut block = period_block(d.tui_label_monthly, &t.monthly);
+            // Goal-achievement line: green check if the month's achieved net
+            // profit meets the month's net-profit goal, red cross otherwise.
+            let m_goal = state.monthly_goal(m);
+            let (m_mark, m_mark_style) = if t.monthly.profit >= m_goal as f64 {
+                ("\u{2714}", Style::default().fg(Color::Green))
+            } else {
+                ("\u{2716}", Style::default().fg(Color::Red))
+            };
+            block.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(m_mark.to_string(), m_mark_style),
+                Span::styled(format!(" {}  {}", d.tui_label_goal, m_goal), val),
+            ]));
+            block
+        }
         Period::FullYear => period_block(d.tui_label_yearly, &t.annual),
     };
 
@@ -2687,6 +2703,9 @@ struct PeriodTotals {
     minutes: f64,
     hours: f64,
     workdays: f64,
+    /// Achieved net profit (sum of capped_units * net_profit_per_unit). Used
+    /// by the Monthly block's goal-achievement indicator.
+    profit: f64,
 }
 
 /// All totals shown in the sidebar's bottom region. `monthly` reflects the
@@ -2707,10 +2726,12 @@ fn compute_totals(state: &AppState) -> Totals {
     let mut a_sales = 0i64;
     let mut a_min = 0.0f64;
     let mut a_workdays = 0.0f64;
+    let mut a_profit = 0.0f64;
     for m in 0..12 {
         let mt_m = state.month_totals_for(m);
         a_sales += mt_m.units;
         a_min += mt_m.achieved_minutes;
+        a_profit += mt_m.profit;
         let wh = state.workday_hours(m) as f64;
         let pp = state.parallel(m) as f64;
         let m_hours = mt_m.achieved_minutes / 60.0;
@@ -2734,12 +2755,14 @@ fn compute_totals(state: &AppState) -> Totals {
             minutes: mt.achieved_minutes,
             hours: m_hours,
             workdays: m_hours / (wh_m * pp_m),
+            profit: mt.profit,
         },
         annual: PeriodTotals {
             sales: a_sales,
             minutes: a_min,
             hours: a_hours,
             workdays: a_workdays,
+            profit: a_profit,
         },
     }
 }

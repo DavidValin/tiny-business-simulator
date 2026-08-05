@@ -123,11 +123,10 @@ against the `target yearly net profit`:
 Each month's goal is divided between products using percentages. Every month
 column always sums to exactly 100%.
 
-  * **Graph tab**: a **Month selector** picks the month (Jan..Dec). Each
-    product has a **monthly-% slider**. Editing it sets that product's % and
-    redistributes the remainder **equally** across all other non-locked
-    products in that month.
-  * **Products tab**: each product shows a **yearly-% slider** (the mean of its
+  * **A month** (selected via `[`/`]`): each product has a **monthly-%
+    slider**. Editing it sets that product's % and redistributes the remainder
+    **equally** across all other non-locked products in that month.
+  * **Full Year**: each product shows a **yearly-% slider** (the mean of its
     12 monthly values). Editing it propagates the target to every month where
     the product isn't month-locked, redistributing within each month.
 
@@ -139,10 +138,10 @@ The yearly total is the **sum** of the 12 months.
 
 Locks freeze a product's percentage so it is excluded from redistribution.
 
-  * **Yearly lock** (Products tab, `Space` on a yearly slider): freezes the
+  * **Yearly lock** (Full Year period, `Space` on a yearly slider): freezes the
     product in **all 12 months**. Month checkboxes render checked and greyed
     out.
-  * **Month lock** (Graph tab, `Space` on a monthly slider): freezes the
+  * **Month lock** (a month period, `Space` on a monthly slider): freezes the
     product only for the selected month (disabled if the product is
     yearly-locked).
 

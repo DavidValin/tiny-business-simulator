@@ -277,7 +277,7 @@ struct AppState {
 struct GlobalSettings {
     /// "min. workday hours" (default 8).
     min_workday_hours: i64,
-    /// "min. paralell products" (default 1).
+    /// "min. parallel products" (default 1).
     min_parallel: i64,
     /// "min. monthly net profit" (default 500).
     min_monthly_net_profit: i64,
@@ -2979,10 +2979,7 @@ struct LoadedState {
 /// entries to the `products` list (by file name). Returns `None` if the file
 /// doesn't exist or contains no usable data. Each month's percentages are
 /// normalized to sum to 100 in case products were added/removed since the
-/// state was saved. Backward-compatible with the v1 format (the old single
-/// `workday_hours` / `parallel` / `monthly_goal` / `yearly_goal` /
-/// `selected_month` keys are mapped onto the new global minimums + per-month
-/// overrides).
+/// state was saved.
 fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<LoadedState> {
     let path = state_file_path(folder);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -3009,9 +3006,6 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
     let mut month_overrides = MonthOverrides::default();
     let mut period = Period::FullYear;
     let mut found_any = false;
-
-    // v1 backward-compat temporaries.
-    let mut v1_selected_month: Option<usize> = None;
 
     let parse_arr12 = |rest: &str| -> Option<[i64; 12]> {
         let toks: Vec<&str> = rest.split_whitespace().collect();
@@ -3086,34 +3080,6 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
             found_any = true;
             continue;
         }
-        // v1 backward-compat settings lines.
-        if let Some(rest) = line.strip_prefix("workday_hours ") {
-            settings.min_workday_hours = rest.trim().parse().unwrap_or(settings.min_workday_hours);
-            found_any = true;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("parallel ") {
-            settings.min_parallel = rest.trim().parse().unwrap_or(settings.min_parallel);
-            found_any = true;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("monthly_goal ") {
-            settings.min_monthly_net_profit =
-                rest.trim().parse().unwrap_or(settings.min_monthly_net_profit);
-            found_any = true;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("yearly_goal ") {
-            settings.target_yearly_net_profit =
-                rest.trim().parse().unwrap_or(settings.target_yearly_net_profit);
-            found_any = true;
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("selected_month ") {
-            v1_selected_month = Some(rest.trim().parse::<usize>().unwrap_or(0).min(11));
-            found_any = true;
-            continue;
-        }
         // Product line: "file pct[0..11] mlock[0..11] ylock" = 26 tokens.
         let tokens: Vec<&str> = line.split_whitespace().collect();
         if tokens.len() >= 26 {
@@ -3132,14 +3098,6 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
 
     if !found_any {
         return None;
-    }
-
-    // v1 backward-compat: if a selected_month was saved but no v2 `period`
-    // line was present, restore that month as the active period.
-    if matches!(period, Period::FullYear) {
-        if let Some(m) = v1_selected_month {
-            period = Period::Month(m);
-        }
     }
 
     // Clamp overrides to the loaded minimums (the minimums may have changed).

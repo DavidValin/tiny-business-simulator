@@ -1069,3 +1069,252 @@ fn compact_value_does_not_decrease_when_value_grows() {
         "compact_value decreased when value grew: {a} -> {b}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Multi-product capacity capping
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compute_month_scales_multiple_products_proportionally() {
+    // Two products with different durations. When capacity is exceeded,
+    // both are scaled by the same factor so total achieved minutes fit.
+    let products = vec![
+        prod("A", 10.0, 5.0, 10.0), // net 5, dur 10 min
+        prod("B", 10.0, 5.0, 20.0), // net 5, dur 20 min
+    ];
+    let mut state = make_state(products);
+    // Goal 1000, 50/50 split -> each: ceil(500/5)=100 sales.
+    // Required minutes: A=100*10=1000, B=100*20=2000, total=3000.
+    // Capacity with 1h/day, 1 parallel: 1*22*60=1320.
+    // Scale = 1320/3000 = 0.44.
+    // Capped: A=floor(100*0.44)=44, B=floor(100*0.44)=44.
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 1000);
+    state.period = Period::Month(0);
+    let mt = state.month_totals();
+    assert_eq!(mt.units, 88); // 44 + 44
+    // Achieved minutes: 44*10 + 44*20 = 440 + 880 = 1320 = capacity
+    assert!((mt.achieved_minutes - 1320.0).abs() < 1e-9);
+    assert!((mt.capacity_minutes - 1320.0).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// Annual workdays summed per-month (each using its own override)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compute_totals_annual_workdays_sum_per_month() {
+    // Each month has different workday hours, so annual workdays must be
+    // the sum of per-month workdays (each using its own override), not a
+    // single global value.
+    let products = vec![prod("A", 10.0, 5.0, 60.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 1, 1000);
+    // Month 0: 16h/day (more capacity -> not capped, 200 units).
+    // Months 1..11: 8h/day (capped: 176 units).
+    state.month_overrides.workday[0] = 16;
+
+    // Month 0: capacity = 16*22*60 = 21120 > 12000 (required) -> 200 units.
+    //   achieved = 12000, hours = 200, workdays = 200/16 = 12.5.
+    // Months 1..11: capacity = 8*22*60 = 10560 < 12000 -> scale = 0.88.
+    //   capped = floor(200*0.88) = 176, achieved = 10560, hours = 176,
+    //   workdays = 176/8 = 22.
+    let t = compute_totals(&state);
+    let expected = 12.5 + 22.0 * 11.0;
+    assert!(
+        (t.annual.workdays - expected).abs() < 1e-6,
+        "annual workdays = {}, expected {}",
+        t.annual.workdays, expected
+    );
+}
+
+#[test]
+fn compute_totals_with_varying_monthly_goals() {
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 1, 500);
+    // Month 0: goal 2000 (not capped, capacity 10560 > 2000).
+    // Months 1..11: goal 500 (not capped).
+    state.month_overrides.net_profit[0] = 2000;
+    // Month 0: ceil(2000/5)=400 sales, 400*5=2000 min.
+    // Months 1..11: ceil(500/5)=100 sales, 100*5=500 min.
+    let t = compute_totals(&state);
+    assert_eq!(t.annual.sales, 400 + 100 * 11);
+    assert!((t.annual.minutes - (2000.0 + 500.0 * 11.0)).abs() < 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// Goal-achievement indicator logic
+// ---------------------------------------------------------------------------
+
+#[test]
+fn monthly_profit_meets_goal_when_capacity_sufficient() {
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 1, 1000);
+    state.period = Period::Month(0);
+    let t = compute_totals(&state);
+    // Goal 1000, net 5 -> 200 sales -> profit = 200*5 = 1000 = goal.
+    assert!((t.monthly.profit - 1000.0).abs() < 1e-9);
+    assert!(t.monthly.profit >= state.monthly_goal(0) as f64);
+}
+
+#[test]
+fn monthly_profit_does_not_meet_goal_when_capped() {
+    let products = vec![prod("A", 10.0, 5.0, 60.0)];
+    let mut state = make_state(products);
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 1000);
+    state.period = Period::Month(0);
+    let t = compute_totals(&state);
+    // Goal 1000 but capacity-limited -> profit < 1000.
+    assert!(
+        t.monthly.profit < 1000.0,
+        "goal should not be met, profit = {}",
+        t.monthly.profit
+    );
+    assert!(t.monthly.profit < state.monthly_goal(0) as f64);
+}
+
+#[test]
+fn yearly_ref_check_matches_sum_of_monthly_goals() {
+    // The Yearly ref block compares sum of 12 monthly goals vs target yearly.
+    // When the sum meets the target, the check should pass.
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    // Default min_monthly_net_profit = 500 -> 12 * 500 = 6000.
+    state.settings.target_yearly_net_profit = 6000;
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m)).sum();
+    assert_eq!(year_sum, 6000);
+    assert!(year_sum >= state.settings.target_yearly_net_profit);
+
+    // Lower the target -> check passes (sum >= target).
+    // Raise the target above 6000 -> check fails.
+    state.settings.target_yearly_net_profit = 7000;
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m)).sum();
+    assert!(year_sum < state.settings.target_yearly_net_profit);
+}
+
+// ---------------------------------------------------------------------------
+// Export file numeric content correctness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn export_results_contains_correct_numeric_values() {
+    let dir = std::env::temp_dir().join("tui_export_values_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // net profit = 4.5 - 1.15 = 3.35; duration = 5 min.
+    let r = ProductResult {
+        name: "Coffee".into(),
+        price: 4.5,
+        currency: Currency::new("USD"),
+        total_cost: 1.15,
+        net_profit: 3.35,
+        profit_percent: 74.44,
+        duration_minutes: 5.0,
+    };
+    let f = dir.join("p0.txt");
+    std::fs::write(&f, "+ stub\n").unwrap();
+    let paths = vec![(f, r)];
+
+    let n = 1;
+    let monthly_pct = vec![[100i64; 12]];
+    let mut state = AppState {
+        products: paths,
+        folder: dir.clone(),
+        monthly_pct,
+        month_locked: vec![[false; 12]; n],
+        yearly_locked: vec![false; n],
+        period: Period::FullYear,
+        sliders: Vec::new(),
+        selected: 0,
+        scroll: 0,
+        status: None,
+        tab: Tab::Products,
+        product_scroll: 0,
+        lang: Lang::En,
+        active_region: Region::Main,
+        show_help: false,
+        help_scroll: 0,
+        settings: GlobalSettings {
+            min_workday_hours: DEFAULT_MIN_WORKDAY_HOURS,
+            min_parallel: DEFAULT_MIN_PARALLEL,
+            min_monthly_net_profit: DEFAULT_MIN_MONTHLY_NET_PROFIT,
+            target_yearly_net_profit: DEFAULT_TARGET_YEARLY_NET_PROFIT,
+        },
+        month_overrides: MonthOverrides::default(),
+    };
+    state.rebuild_sliders();
+    // Default goal 500. sales = ceil(500/3.35) = ceil(149.25) = 150.
+    // minutes = 150 * 5 = 750. annual_sales = 150 * 12 = 1800.
+
+    let status = export_results(&state, &Lang::En);
+    assert!(status.contains("exported"), "status was: {}", status);
+
+    let product_file = std::fs::read_to_string(dir.join("p0.simulation_results.txt")).unwrap();
+    assert!(product_file.contains("Coffee"), "missing product name");
+    assert!(product_file.contains("4.50"), "missing sale price");
+    assert!(product_file.contains("1.15"), "missing total cost");
+    assert!(product_file.contains("3.35"), "missing net profit per unit");
+    assert!(product_file.contains("74.44"), "missing profit margin");
+    // Monthly sales 150 in each month row.
+    assert!(product_file.contains("150"), "missing monthly sales 150");
+    // Annual sales = 1800.
+    assert!(product_file.contains("1800"), "missing annual sales 1800");
+
+    let totals_file = std::fs::read_to_string(dir.join("totals.simulation_results.txt")).unwrap();
+    assert!(totals_file.contains("1800"), "missing total annual sales 1800");
+
+    // The state file was saved.
+    assert!(dir.join(".simulation_state").exists(), "state file not saved");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// redistribute_month edge case: setting a product to 0
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redistribute_month_setting_zero_distributes_to_others() {
+    let products = vec![
+        prod("A", 10.0, 5.0, 5.0),
+        prod("B", 10.0, 5.0, 5.0),
+        prod("C", 10.0, 5.0, 5.0),
+    ];
+    let mut state = make_state(products);
+    state.monthly_pct[0][0] = 40;
+    state.monthly_pct[1][0] = 30;
+    state.monthly_pct[2][0] = 30;
+    redistribute_month(&mut state, 0, 0, 0);
+    assert_eq!(state.monthly_pct[0][0], 0);
+    let sum: i64 = state.monthly_pct.iter().map(|p| p[0]).sum();
+    assert_eq!(sum, 100);
+    // B and C split the 100 equally (50/50).
+    assert_eq!(state.monthly_pct[1][0], 50);
+    assert_eq!(state.monthly_pct[2][0], 50);
+}
+
+// ---------------------------------------------------------------------------
+// word_wrap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn word_wrap_breaks_at_spaces() {
+    let lines = word_wrap("hello world foo bar", 10);
+    assert_eq!(lines, vec!["hello", "world foo", "bar"]);
+}
+
+#[test]
+fn word_wrap_hard_splits_long_words() {
+    let lines = word_wrap("abcdefghij", 4);
+    assert_eq!(lines, vec!["abcd", "efgh", "ij"]);
+}
+
+#[test]
+fn word_wrap_empty_returns_empty_line() {
+    let lines = word_wrap("", 10);
+    assert_eq!(lines, vec![""]);
+}

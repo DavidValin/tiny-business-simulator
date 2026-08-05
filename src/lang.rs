@@ -156,6 +156,7 @@ pub struct Dict {
     pub tui_axis_max: &'static str,
     pub tui_max: &'static str,
     pub tui_profit: &'static str,
+    pub tui_cost: &'static str,
     pub tui_yearly: &'static str,
 
     // --- tui.rs : donut captions ---------------------------------------------
@@ -972,6 +973,7 @@ define_dict! {
     tui_axis_max: ["axis max", "máx. eje", "轴最大值", "Achsenmax", "макс. оси", "max. axe"],
     tui_max: ["max", "máx", "最大", "Max", "макс", "max"],
     tui_profit: ["profit", "beneficio", "利润", "Gewinn", "прибыль", "profit"],
+    tui_cost: ["cost", "coste", "成本", "Kosten", "затраты", "coût"],
     tui_yearly: ["yearly", "anual", "年度", "jährlich", "годовой", "annuel"],
 
     // --- tui.rs : donut captions ---------------------------------------------

@@ -547,9 +547,9 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         Some(m) => {
             let mt = &months[m];
             format!(
-                "  {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0})   {7}: n={8} \u{00a4}={9:.0} ({10} {11:.0})",
+                "  {0}: {1:.0}   {2}: n={3} \u{00a4}={4:.0} ({5} {6:.0} {7} {8:.0})   {9}: n={10} \u{00a4}={11:.0} ({12} {13:.0})",
                 d.tui_axis_max, max_with_headroom,
-                mnames[m], mt.units, mt.amount, d.tui_profit, mt.profit,
+                mnames[m], mt.units, mt.amount, d.tui_profit, mt.profit, d.tui_cost, mt.cost,
                 d.tui_yearly, yearly_units, yearly_amount, d.tui_profit, yearly_profit,
             )
         }
@@ -656,21 +656,24 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         // Render the numeric value at the base of each bar / region.
         let n_h = (units / max * bar_h as f64).round() as i64;
         if n_h >= 1 {
-            render_bar_value(buf, n_x, bar_bottom, bar_width, &mt.units.to_string(), Color::Cyan);
+            render_bar_value(buf, n_x, bar_bottom, bar_width, &compact_value(units), Color::Cyan);
         }
         let total_h = (amount / max * bar_h as f64).round() as i64;
         let total_h = total_h.clamp(0, bar_h as i64);
         let mut profit_h = (profit / max * bar_h as f64).round() as i64;
         profit_h = profit_h.clamp(0, total_h);
         if profit_h >= 1 {
-            render_bar_value(buf, d_x, bar_bottom, bar_width, &format!("{:.0}", profit), Color::Green);
+            render_bar_value(buf, d_x, bar_bottom, bar_width, &compact_value(profit), Color::Green);
         }
         let cost_h = total_h - profit_h;
-        // Total $ (sales amount) at the TOP of the $ bar.
-        if total_h >= 1 {
+        // Cost ($) at the TOP of the yellow cost region, matching the legend.
+        if cost_h >= 1 {
             let y_top = bar_bottom.saturating_sub((total_h - 1) as u16);
-            let top_bg = if cost_h >= 1 { Color::Yellow } else { Color::Green };
-            render_bar_value(buf, d_x, y_top, bar_width, &format!("{:.0}", amount), top_bg);
+            render_bar_value(buf, d_x, y_top, bar_width, &compact_value(mt.cost), Color::Yellow);
+        } else if total_h >= 1 && profit_h >= 1 {
+            // No cost region: show total amount at the top (all-profit bar).
+            let y_top = bar_bottom.saturating_sub((total_h - 1) as u16);
+            render_bar_value(buf, d_x, y_top, bar_width, &compact_value(amount), Color::Green);
         }
 
         // Bar labels (n / $) just under the bars.
@@ -1524,9 +1527,27 @@ fn time_line_rendered(
 }
 
 
-/// Render `text` centered within a `width`-cell-wide bar column at row `y`,
-/// clipped to the column width.  Drawn as black bold text on a `bg` colored
-/// cell so the value reads as embedded in the bar.
+/// Format a number compactly for display inside narrow bar columns.
+///
+/// Values < 1000 are shown as-is. Larger values use K/M suffixes so they
+/// stay short enough to fit in 2–4 cells, avoiding truncation that would
+/// make a growing value appear to shrink (e.g. 8800 → "88" vs "9K").
+fn compact_value(v: f64) -> String {
+    let v_abs = v.abs();
+    if v_abs >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if v_abs >= 1_000.0 {
+        format!("{}K", (v / 1_000.0).round() as i64)
+    } else {
+        format!("{:.0}", v)
+    }
+}
+
+/// Render `text` centered within a `width`-cell-wide bar column at row `y`.
+/// Drawn as black bold text on a `bg` colored cell so the value reads as
+/// embedded in the bar.  If the text is wider than the bar it overflows to
+/// the right (into the inter-bar gap) rather than being truncated, so the
+/// value is always correct.
 fn render_bar_value(
     buf: &mut ratatui::buffer::Buffer,
     x: u16,
@@ -1538,18 +1559,17 @@ fn render_bar_value(
     if width == 0 || text.is_empty() {
         return;
     }
-    let chars: Vec<char> = text.chars().take(width as usize).collect();
-    if chars.is_empty() {
-        return;
-    }
-    let s: String = chars.into_iter().collect();
-    let w = s.chars().count() as u16;
-    let start_x = x + (width.saturating_sub(w)) / 2;
+    let w = text.chars().count() as u16;
+    let start_x = if w >= width {
+        x
+    } else {
+        x + (width - w) / 2
+    };
     let style = Style::default()
         .fg(Color::Black)
         .bg(bg)
         .add_modifier(Modifier::BOLD);
-    buf.set_string(start_x, y, &s, style);
+    buf.set_string(start_x, y, text, style);
 }
 
 /// Fractional block character for the top cell of a single-color bar.
@@ -2736,18 +2756,21 @@ fn compute_totals(state: &AppState) -> Totals {
 fn update_parallel_range(state: &mut AppState) {
     // Only the per-month parallel override slider (shown when a Month period
     // is active) has a computed range. Its min is the global `min_parallel`
-    // floor; its max is the throughput that brings that month down to 1
-    // workday (using that month's own workday hours). The state field is
-    // clamped into range too so the displayed value and the simulation agree.
+    // floor; its max is the throughput that brings that month's required
+    // production down to ~1 hour of work. Crucially the max is derived from a
+    // fixed 1-hour reference — NOT from the month's current workday hours —
+    // so raising workday hours never shrinks the cap and clamps `parallel`
+    // back down. Both sliders thus independently grow the monthly capacity
+    // (workday_hours × 22 × 60 × parallel) toward the net-profit goal. The
+    // state field is clamped into range so the displayed value and the
+    // simulation agree.
     let Some(m) = state.period.month() else {
         return;
     };
     let monthly_minutes: f64 = month_shares(state, m).iter().map(|s| s.monthly_minutes).sum();
-    let wh = state.workday_hours(m).max(1) as f64;
     let min_par = state.settings.min_parallel.max(1);
     let monthly_hours = monthly_minutes / 60.0;
-    let max_par = (monthly_hours / wh).floor() as i64;
-    let max_par = max_par.max(min_par);
+    let max_par = (monthly_hours.floor() as i64).max(min_par);
     let lo = state.month_overrides.parallel[m].max(min_par);
     let clamped = lo.min(max_par).max(min_par);
     state.month_overrides.parallel[m] = clamped;
@@ -3215,12 +3238,12 @@ fn make_settings_slider(kind: SliderKind, state: &AppState) -> Slider {
         SliderKind::MonthParallel(m) => {
             // The max is refined by `update_parallel_range`; start with a
             // generous upper bound so the slider is usable before that runs.
+            // Uses the same 1-hour reference as `update_parallel_range` so the
+            // cap does not depend on the current workday hours.
             let min_par = state.settings.min_parallel.max(1);
             let monthly_minutes: f64 =
                 month_shares(state, m).iter().map(|s| s.monthly_minutes).sum();
-            let wh = state.workday_hours(m).max(1) as f64;
-            let max_par = ((monthly_minutes / 60.0) / wh).floor() as i64;
-            let max_par = max_par.max(min_par);
+            let max_par = ((monthly_minutes / 60.0).floor() as i64).max(min_par);
             let val = state.month_overrides.parallel[m].max(min_par).min(max_par);
             Slider {
                 kind,

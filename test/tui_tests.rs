@@ -386,7 +386,8 @@ fn yearly_lock_renders_month_checkbox_checked_and_greyed() {
 #[test]
 fn month_parallel_range_caps_to_one_workday() {
     // 1 product, net 5, dur 60, goal 1000 -> 200 sales -> 12000 min ->
-    // 200 monthly hours. workday 8 -> max_par = floor(200/8) = 25.
+    // 200 monthly hours. The cap uses a fixed 1-hour reference (independent
+    // of workday hours), so max_par = floor(200) = 200.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
     set_all_months(&mut state, 8, 1, 1000);
@@ -400,14 +401,49 @@ fn month_parallel_range_caps_to_one_workday() {
         .find(|s| matches!(s.kind, SliderKind::MonthParallel(_)))
         .unwrap();
     assert_eq!(p.min, 1);
-    assert_eq!(p.max, 25);
+    assert_eq!(p.max, 200);
     assert!(p.value >= p.min && p.value <= p.max);
 }
 
 #[test]
+fn month_parallel_range_decoupled_from_workday_hours() {
+    // Raising workday hours must NOT shrink the parallel cap or clamp the
+    // stored parallel value down — both sliders independently grow capacity.
+    let products = vec![prod("A", 10.0, 5.0, 60.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 50, 1000);
+    state.period = Period::Month(0);
+    state.rebuild_sliders();
+    update_parallel_range(&mut state);
+    let max_at_8h = state
+        .sliders
+        .iter()
+        .find(|s| matches!(s.kind, SliderKind::MonthParallel(_)))
+        .unwrap()
+        .max;
+    let par_at_8h = state.month_overrides.parallel[0];
+
+    // Double workday hours; the cap and stored parallel must be unchanged.
+    state.month_overrides.workday[0] = 16;
+    state.rebuild_sliders();
+    update_parallel_range(&mut state);
+    let p = state
+        .sliders
+        .iter()
+        .find(|s| matches!(s.kind, SliderKind::MonthParallel(_)))
+        .unwrap();
+    assert_eq!(p.max, max_at_8h, "parallel cap shrank when workday hours rose");
+    assert_eq!(
+        state.month_overrides.parallel[0], par_at_8h,
+        "parallel value was clamped down when workday hours rose"
+    );
+}
+
+#[test]
 fn month_parallel_clamps_value_into_range() {
-    // Goal 100000, workday 1 -> 20000 monthly hours -> max_par = 20000.
-    // Setting the override above the max clamps it down to the max.
+    // Goal 100000 -> 20000 sales -> 1,200,000 min -> 20000 monthly hours.
+    // max_par uses the 1-hour reference = floor(20000) = 20000. Setting the
+    // override above the max clamps it down to the max.
     let products = vec![prod("A", 10.0, 5.0, 60.0)];
     let mut state = make_state(products);
     state.settings.min_workday_hours = 1;
@@ -992,5 +1028,44 @@ fn graph_arrow_marks_selected_month_bars() {
     assert!(
         (0..buf.area.height).any(|y| find_in_row(&buf, y, "Apr").is_some()),
         "selected month Apr label not rendered in the chart"
+    );
+}
+
+#[test]
+fn compact_value_formats_small_numbers_as_is() {
+    assert_eq!(compact_value(0.0), "0");
+    assert_eq!(compact_value(42.0), "42");
+    assert_eq!(compact_value(999.0), "999");
+}
+
+#[test]
+fn compact_value_uses_k_suffix_for_thousands() {
+    assert_eq!(compact_value(1000.0), "1K");
+    assert_eq!(compact_value(1500.0), "2K");
+    assert_eq!(compact_value(9999.0), "10K");
+    assert_eq!(compact_value(14500.0), "15K");
+}
+
+#[test]
+fn compact_value_uses_m_suffix_for_millions() {
+    assert_eq!(compact_value(1_000_000.0), "1.0M");
+    assert_eq!(compact_value(1_500_000.0), "1.5M");
+}
+
+#[test]
+fn compact_value_does_not_decrease_when_value_grows() {
+    // Regression: when a value crosses a power of 10, the old truncation
+    // made the displayed value shrink (e.g. 8800 → "88", 14500 → "14").
+    // With compact_value the displayed order of magnitude never goes backwards.
+    let a = compact_value(8800.0);   // "9K"
+    let b = compact_value(14500.0);  // "15K"
+    assert!(
+        b.ends_with('K') && a.ends_with('K'),
+        "both should use K suffix"
+    );
+    let parse_k = |s: &str| s.trim_end_matches('K').parse::<f64>().unwrap();
+    assert!(
+        parse_k(&b) > parse_k(&a),
+        "compact_value decreased when value grew: {a} -> {b}"
     );
 }

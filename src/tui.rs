@@ -956,7 +956,8 @@ fn render_product_details_full_year(frame: &mut ratatui::Frame, area: Rect, stat
     );
     let strip_x = inner.x + text_w;
 
-    let lines = build_product_details_lines(state);
+    let details = build_product_details_lines(state);
+    let lines = &details.lines;
     let total = lines.len();
     let visible = inner.height as usize;
     // Clamp the scroll offset to the valid range, leaving the last page full
@@ -968,7 +969,7 @@ fn render_product_details_full_year(frame: &mut ratatui::Frame, area: Rect, stat
     }
 
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .scroll((state.product_scroll as u16, 0)),
         text_area,
@@ -982,31 +983,31 @@ fn render_product_details_full_year(frame: &mut ratatui::Frame, area: Rect, stat
         (0..12).map(|m| state.capped_product_sales(m)).collect();
     let rule_style = Style::default().fg(Color::DarkGray);
 
-    for k in 0..n {
-        let product_start = k * LINES_PER_PRODUCT;
-        let content_start = product_start + PROD_PAD;
-
-        // Full-width separator rule across the inner width, drawn over the
-        // blank line that build_product_details_lines inserts after each
-        // product's padded area (the line at product_start + PRODUCT_AREA_H).
-        if k + 1 < n {
-            let sep_line = product_start + PRODUCT_AREA_H;
-            let sep_y = inner.y as i64 + sep_line as i64 - state.product_scroll as i64;
-            if sep_y >= inner.y as i64 && sep_y < (inner.y + inner.height) as i64 {
-                let y = sep_y as u16;
-                let mut x = inner.x;
-                while x < inner.x + inner.width {
-                    buf.set_string(x, y, "\u{2500}", rule_style);
-                    x += 1;
-                }
+    // Full-width separator rules between products, drawn over the blank lines
+    // that build_product_details_lines inserts after each product's padded
+    // area.  The positions are tracked dynamically so they stay correct even
+    // if the number of fields per product varies.
+    for &sep_line in &details.separator_lines {
+        let sep_y = inner.y as i64 + sep_line as i64 - state.product_scroll as i64;
+        if sep_y >= inner.y as i64 && sep_y < (inner.y + inner.height) as i64 {
+            let y = sep_y as u16;
+            let mut x = inner.x;
+            while x < inner.x + inner.width {
+                buf.set_string(x, y, "\u{2500}", rule_style);
+                x += 1;
             }
         }
+    }
+
+    for k in 0..n {
+        let product_start = details.product_starts[k];
+        let content_start = product_start + PROD_PAD;
 
         // Two donut graphs, vertically centered within the product's padded
         // area (top pad + content + bottom pad).  Only draw when the whole
         // donut block is on screen so the ring never gets clipped mid-shape.
-        let donut_top_line =
-            content_start as i64 + (PRODUCT_CONTENT_LINES as i64 - DONUT_BLOCK_H as i64) / 2;
+        let donut_top_line = content_start as i64
+            + (details.content_lines[k] as i64 - DONUT_BLOCK_H as i64) / 2;
         let screen_y = inner.y as i64 + donut_top_line - state.product_scroll as i64;
         if screen_y < inner.y as i64
             || screen_y + DONUT_BLOCK_H as i64 > (inner.y + inner.height) as i64
@@ -1093,7 +1094,8 @@ fn render_product_details_month(
         inner.height,
     );
 
-    let lines = build_product_details_lines_month(state, m);
+    let details = build_product_details_lines_month(state, m);
+    let lines = &details.lines;
     let total = lines.len();
     let visible = inner.height as usize;
     if total <= visible {
@@ -1103,7 +1105,7 @@ fn render_product_details_month(
     }
 
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(lines.clone())
             .wrap(Wrap { trim: false })
             .scroll((state.product_scroll as u16, 0)),
         text_area,
@@ -1111,23 +1113,18 @@ fn render_product_details_month(
 
     // Separator rules between products: one blank line per product boundary
     // (the last product has no trailing separator) is overdrawn with a rule.
+    // The positions are tracked dynamically so they stay correct even if the
+    // number of fields per product varies.
     let buf = frame.buffer_mut();
-    let n = state.products.len();
     let rule_style = Style::default().fg(Color::DarkGray);
-    // Month-view layout per product: top pad (1) + content (9) + bottom pad (1)
-    // = 11 lines, plus 1 separator blank = 12 lines per product.
-    let lines_per_product_month = MONTH_PRODUCT_CONTENT_LINES + 2 * PROD_PAD + 1;
-    for k in 0..n {
-        if k + 1 < n {
-            let sep_line = k * lines_per_product_month + (MONTH_PRODUCT_CONTENT_LINES + 2 * PROD_PAD);
-            let sep_y = inner.y as i64 + sep_line as i64 - state.product_scroll as i64;
-            if sep_y >= inner.y as i64 && sep_y < (inner.y + inner.height) as i64 {
-                let y = sep_y as u16;
-                let mut x = inner.x;
-                while x < inner.x + inner.width {
-                    buf.set_string(x, y, "\u{2500}", rule_style);
-                    x += 1;
-                }
+    for &sep_line in &details.separator_lines {
+        let sep_y = inner.y as i64 + sep_line as i64 - state.product_scroll as i64;
+        if sep_y >= inner.y as i64 && sep_y < (inner.y + inner.height) as i64 {
+            let y = sep_y as u16;
+            let mut x = inner.x;
+            while x < inner.x + inner.width {
+                buf.set_string(x, y, "\u{2500}", rule_style);
+                x += 1;
             }
         }
     }
@@ -1153,16 +1150,11 @@ fn render_product_details_month(
     }
 }
 
-/// Number of text lines describing one product in the month details view:
-/// 6 stats + 1 blank + 1 month row + 1 blank + 1 workday + 1 parallel +
-/// 1 net-profit = 11. Excludes padding and the separator blank.
-const MONTH_PRODUCT_CONTENT_LINES: usize = 11;
-
 /// Build the per-product lines for the Month-period Products view: stats block
 /// + the selected month's row + that month's workday / parallel / net-profit
 /// override settings. Products are separated by a blank line (overdrawn as a
 /// rule by the renderer).
-fn build_product_details_lines_month(state: &AppState, m: usize) -> Vec<Line<'static>> {
+fn build_product_details_lines_month(state: &AppState, m: usize) -> ProductDetails {
     let d = state.lang.dict();
     let workday_hours = state.workday_hours(m);
     let parallel = state.parallel(m);
@@ -1192,11 +1184,16 @@ fn build_product_details_lines_month(state: &AppState, m: usize) -> Vec<Line<'st
     let setting_style = Style::default().fg(Color::Green);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut product_starts: Vec<usize> = Vec::new();
+    let mut content_lines: Vec<usize> = Vec::new();
+    let mut separator_lines: Vec<usize> = Vec::new();
     for (i, (_, r)) in state.products.iter().enumerate() {
         let cur = r.currency.to_string();
 
         // Top padding.
+        let product_start = lines.len();
         lines.push(Line::from(""));
+        let content_start = lines.len();
 
         // Product stats block.
         let stats: Vec<(&'static str, Vec<String>)> = vec![
@@ -1255,16 +1252,25 @@ fn build_product_details_lines_month(state: &AppState, m: usize) -> Vec<Line<'st
         )));
 
         // Bottom padding.
+        let cl = lines.len() - content_start;
         lines.push(Line::from(""));
 
         // Separator blank (overdrawn as a rule by the renderer, except after
         // the last product).
         if i + 1 < state.products.len() {
+            separator_lines.push(lines.len());
             lines.push(Line::from(""));
         }
+        product_starts.push(product_start);
+        content_lines.push(cl);
     }
 
-    lines
+    ProductDetails {
+        lines,
+        product_starts,
+        content_lines,
+        separator_lines,
+    }
 }
 
 /// Width (cells) and height (rows) of one donut graph.  The ring is drawn with
@@ -1281,16 +1287,20 @@ const DONUT_GAP: u16 = 4;
 /// Per-product padding (cells/lines) on every side of the product's content
 /// block in the details view.
 const PROD_PAD: usize = 1;
-/// Number of text lines that describe one product in the details view (stats +
-/// 12 monthly rows + annual + workday/parallel), excluding padding and the
-/// separator. 6 stats + 1 blank + 12 months + 1 blank + 2 annual + 1 blank +
-/// 2 workday/parallel = 25.
-const PRODUCT_CONTENT_LINES: usize = 25;
-/// A product's padded area height: top pad + content + bottom pad.
-const PRODUCT_AREA_H: usize = 2 * PROD_PAD + PRODUCT_CONTENT_LINES;
-/// Lines per product in the scrollable Paragraph: padded area + one separator
-/// blank line (except the last product, which has no trailing separator).
-const LINES_PER_PRODUCT: usize = PRODUCT_AREA_H + 1;
+
+/// Result of building the per-product details lines: the rendered lines plus
+/// layout metadata used by the renderer to position separators and donut
+/// graphs without relying on hardcoded line counts (fields may vary).
+struct ProductDetails {
+    /// All rendered lines (padded content + separator blanks).
+    lines: Vec<Line<'static>>,
+    /// Line index where each product's padded area begins (top padding line).
+    product_starts: Vec<usize>,
+    /// Number of content lines (excluding top/bottom padding) per product.
+    content_lines: Vec<usize>,
+    /// Line indices of the separator blanks between products.
+    separator_lines: Vec<usize>,
+}
 
 /// Braille dot bit for sub-cell column `dc` (0=left, 1=right) and row `dr`
 /// (0..4), per the U+2800..U+28FF mapping.
@@ -1433,7 +1443,7 @@ fn clip_set_str(
 /// goal/time (annual = sum of the 12 months), and the shared workday/parallel
 /// settings.  The label column width is computed across all templates (just
 /// like `write_result_file_monthly`) so the value columns line up.
-fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
+fn build_product_details_lines(state: &AppState) -> ProductDetails {
     let d = state.lang.dict();
     // The Full Year view shows the global minimum workday / parallel as the
     // reference settings (each month's own override is reflected in its
@@ -1474,11 +1484,16 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
     let selected_month = state.period.month();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut product_starts: Vec<usize> = Vec::new();
+    let mut content_lines: Vec<usize> = Vec::new();
+    let mut separator_lines: Vec<usize> = Vec::new();
     for (i, (_, r)) in state.products.iter().enumerate() {
         let cur = r.currency.to_string();
 
         // Top padding (1 blank line).
+        let product_start = lines.len();
         lines.push(Line::from(""));
+        let content_start = lines.len();
 
         // Product stats block.
         let stats: Vec<(&'static str, Vec<String>)> = vec![
@@ -1557,16 +1572,25 @@ fn build_product_details_lines(state: &AppState) -> Vec<Line<'static>> {
         )));
 
         // Bottom padding (1 blank line).
+        let cl = lines.len() - content_start;
         lines.push(Line::from(""));
 
         // Separator between products (not after the last one): a single blank
         // line that render_product_details overdraws with a full-width rule.
         if i + 1 < state.products.len() {
+            separator_lines.push(lines.len());
             lines.push(Line::from(""));
         }
+        product_starts.push(product_start);
+        content_lines.push(cl);
     }
 
-    lines
+    ProductDetails {
+        lines,
+        product_starts,
+        content_lines,
+        separator_lines,
+    }
 }
 
 /// Render a "time line" the same way `simulator::time_line` does for the

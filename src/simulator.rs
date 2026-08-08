@@ -23,7 +23,8 @@ pub(crate) fn print_error(msg: &str) {
 // ---------------------------------------------------------------------------
 
 /// List `.txt` product-definition files in `path`, excluding generated
-/// `*.simulation_results.txt` files, sorted for stable ordering.
+/// `*.simulation_results.txt` files and the non-hidden `simulation_state.txt`
+/// state file, sorted for stable ordering.
 pub(crate) fn collect_txt_files(path: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = fs::read_dir(path) {
@@ -33,7 +34,10 @@ pub(crate) fn collect_txt_files(path: &Path) -> Vec<PathBuf> {
                 continue;
             }
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name.ends_with(".txt") && !name.ends_with(".simulation_results.txt") {
+            if name.ends_with(".txt")
+                && !name.ends_with(".simulation_results.txt")
+                && name != "simulation_state.txt"
+            {
                 files.push(p);
             }
         }

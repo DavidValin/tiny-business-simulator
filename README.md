@@ -61,7 +61,9 @@ Obtain simulation results (per product and totals) to meet your business goals:
   * required `yearly workdays`
   * required `yearly work time` in minutes and hours
 
-Yearly barchart graph with sales number and (sales amount - profit amount) per month
+Yearly barchart graph with sales number and (sales amount - profit amount) per
+month. Above each month's bars a green ✔ marks months whose achieved net profit
+meets that month's goal; a red ✖ marks months that fall short.
 
 ### Global minimums & monthly overrides
 
@@ -74,16 +76,21 @@ sidebar changes accordingly:
     * `min. monthly net profit` (default 500)
     * `target yearly net profit` (default 500, a reference shown next to the
       12 × monthly sum)
-  * **A month** — three *override* sliders: `workday hours`,
-    `parallel products`, and `net profit target` for that month. Each override must be
-    **at least** its global minimum and replaces the minimum for that month
-    only.
+  * **A month** — four *override* sliders: `workday hours`,
+    `parallel products`, `net profit target` and `fix costs` for that month. Each
+    override must be **at least** its global minimum and replaces the minimum
+    for that month only. `fix costs` adds a monthly fixed cost (currency units)
+    subtracted from the month's net profit, so the required sales grow to cover
+    both the goal and the fixed burden.
 
 The monthly net-profit goal used in the `required_sales` formula is therefore
 the per-month value (the override when set, otherwise the global `min. monthly
-net profit`). Workday hours and parallel products are likewise per-month values
-floored by their global minimums. The yearly total is the **sum** of the 12
-monthly results, so the `target yearly net profit` slider is only a reference.
+net profit`); the per-month `fix costs` are added to that goal when computing
+the required sales, and subtracted from the achieved net profit used by the
+goal-achievement check. Workday hours and parallel products are likewise
+per-month values floored by their global minimums. The yearly total is the
+**sum** of the 12 monthly results, so the `target yearly net profit` slider is
+only a reference.
 
 ### Sidebar totals
 
@@ -121,7 +128,8 @@ against the `target yearly net profit`:
 ### Monthly / yearly sales distribution %
 
 Each month's goal is divided between products using percentages. Every month
-column always sums to exactly 100%.
+column always sums to exactly 100%. Percentage sliders move in steps of
+**0.10%** (the value is shown with one decimal, e.g. `50.0%`).
 
   * **A month** (selected via `[`/`]`): each product has a **monthly-%
     slider**. Editing it sets that product's % and redistributes the remainder
@@ -156,11 +164,11 @@ percentages, locks, and settings:
   * one `<product>.simulation_results.txt` per product (stats + 12 monthly rows
     + annual row + workday/parallel)
   * a `totals.simulation_results.txt` aggregating all products
-  * a hidden `.simulation_state` file in the product folder saving percentages,
-    locks, and settings
+  * a non-hidden, plain-text `simulation_state.txt` file in the product folder
+    saving percentages, locks, and settings (editable by hand)
 
 Reopening the app restores the saved distribution.  If products were added or
-removed since the save, each month's percentages are re-normalized to sum to 100.
+removed since the save, each month's percentages are re-normalized to sum to 100%.
 
 ### Interface language
 
@@ -175,8 +183,10 @@ Set the interface language with `--lang <code>` (default `en`):
 
 ### Keys
 
-  * `Tab` — move between sidebar and main area
-  * `Shift+Tab` — move between "Products" and "Graph" sub-tabs
+  * `Tab` — move between "Products" and "Graph" sub-tabs
+  * `Shift+Tab` (or `o`) — move between sidebar and main area (`o` works on
+    all terminals, including raw Linux VTs where Shift+Tab is indistinguishable
+    from Tab)
   * `[` / `]` — move the top-level period selection left / right
     (`Full Year`, `Jan`, `Feb`, … `Dec`)
   * `Up`/`Down` — scroll the main area (Products tab) or navigate the sidebar
@@ -218,7 +228,7 @@ For each product create a .txt file defining:
 * supported currencies: any 3-letter ISO 4217 code (e.g. `USD`, `EUR`, `GBP`, `JPY`, `CAD`, `MXN`, `CNY`)
 * supported production-time units: `mins`, `hours`
 * products whose net profit (price - total cost) is zero or negative are skipped
-* files matching `*.simulation_results.txt` and the hidden `.simulation_state` are ignored by the loader
+* files matching `*.simulation_results.txt` and `simulation_state.txt` are ignored by the loader
 
 Example of a product (`./sample_business/beer.txt`):
 

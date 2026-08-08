@@ -66,6 +66,11 @@ use crate::simulator::{
 /// Workdays assumed per month when deriving the production capacity in minutes.
 const WORKDAYS_PER_MONTH: f64 = 22.0;
 
+/// Percentage sliders store values in tenths of a percent (so 100.0% == 1000)
+/// and step by 1 (= 0.1%). Each month column sums to [`PCT_TOTAL`].
+const PCT_SCALE: i64 = 10;
+const PCT_TOTAL: i64 = 1000;
+
 /// Localized month abbreviations for the current language.
 #[allow(dead_code)]
 fn months(lang: &Lang) -> [&'static str; 12] {
@@ -102,6 +107,7 @@ enum SliderKind {
     MonthWorkdayHours(usize),
     MonthParallel(usize),
     MonthNetProfit(usize),
+    MonthFixCosts(usize),
 }
 
 #[derive(Clone)]
@@ -143,7 +149,13 @@ impl Slider {
 
 /// Human-readable value readout for a slider's track line.
 fn slider_readout(s: &Slider, _lang: &Lang) -> String {
-    format!(" {}{}", s.value, s.suffix)
+    if is_product_pct(s) {
+        // Percent sliders store tenths of a percent; show one decimal so the
+        // 0.1% step is visible (e.g. 500 -> " 50.0%").
+        format!(" {:.1}{}", s.value as f64 / PCT_SCALE as f64, s.suffix)
+    } else {
+        format!(" {}{}", s.value, s.suffix)
+    }
 }
 
 /// Whether a slider is a product-percentage slider (and thus shows the
@@ -300,6 +312,11 @@ struct MonthOverrides {
     workday: [i64; 12],
     parallel: [i64; 12],
     net_profit: [i64; 12],
+    /// Per-month fixed costs (currency units) subtracted from the month's
+    /// net profit. Increases the required sales (the products must cover the
+    /// fix costs on top of the net-profit goal) and reduces the achieved
+    /// profit used for the goal-achievement check.
+    fix_costs: [i64; 12],
 }
 
 impl Default for MonthOverrides {
@@ -308,6 +325,7 @@ impl Default for MonthOverrides {
             workday: [DEFAULT_MIN_WORKDAY_HOURS; 12],
             parallel: [DEFAULT_MIN_PARALLEL; 12],
             net_profit: [DEFAULT_MIN_MONTHLY_NET_PROFIT; 12],
+            fix_costs: [0; 12],
         }
     }
 }
@@ -355,6 +373,14 @@ impl AppState {
         self.month_overrides.net_profit[m].max(self.settings.min_monthly_net_profit).max(0)
     }
 
+    /// Per-month fixed costs (currency units) for month `m`. Always >= 0.
+    /// Subtracting these from the month's contribution gives the net profit
+    /// the goal-achievement check uses; the required sales are computed against
+    /// `monthly_goal + fix_costs` so the products cover the fixed burden too.
+    fn fix_costs(&self, m: usize) -> i64 {
+        self.month_overrides.fix_costs[m].max(0)
+    }
+
     /// Clamp every per-month override array up to the corresponding global
     /// minimum. Called after a minimum slider changes so the invariant
     /// `override >= min` is restored.
@@ -400,6 +426,10 @@ impl AppState {
     /// month's own workday hours, parallel products and net-profit goal.
     fn compute_month(&self, m: usize) -> MonthComputation {
         let monthly_goal = self.monthly_goal(m) as f64;
+        let fix_costs = self.fix_costs(m) as f64;
+        // The products must cover the fixed costs on top of the net-profit
+        // goal, so the per-product contribution target uses goal + fix_costs.
+        let total_target = monthly_goal + fix_costs;
         let workday_hours = self.workday_hours(m) as f64;
         let parallel = self.parallel(m) as f64;
 
@@ -408,7 +438,7 @@ impl AppState {
         let mut req_sales: Vec<i64> = Vec::with_capacity(self.products.len());
         let mut required_minutes = 0.0;
         for (i, (_, p)) in self.products.iter().enumerate() {
-            let target_profit = self.share_for_month(i, m) * monthly_goal;
+            let target_profit = self.share_for_month(i, m) * total_target;
             let s = if p.net_profit > 0.0 {
                 ((target_profit / p.net_profit).ceil() as i64).max(0)
             } else {
@@ -453,6 +483,12 @@ impl AppState {
             total_cost += *units as f64 * p.total_cost;
             achieved_minutes += *units as f64 * p.duration_minutes;
         }
+        // Fixed costs reduce the month's net profit (and raise the effective
+        // cost) so that amount == profit + cost still holds and the
+        // goal-achievement check reflects the fixed burden.
+        let fix = self.fix_costs(m) as f64;
+        total_profit -= fix;
+        total_cost += fix;
 
         MonthTotals {
             units: total_units,
@@ -622,9 +658,14 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
     let chart_x = inner.x + chart_margin + avail_width.saturating_sub(total_chart_width) / 2;
 
     // Reserve 2 rows at the bottom for the bar labels (n/$) and month labels,
-    // and `stats_rows` at the top for the stats line.
+    // and `stats_rows` at the top for the stats line.  The per-month goal tick
+    // / cross markers are drawn inside the chart area, 2 rows above each bar's
+    // actual top (so they sit close to the bar regardless of bar height).
     let label_rows: u16 = 2;
-    let bar_h = inner.height.saturating_sub(label_rows).saturating_sub(stats_rows);
+    let bar_h = inner
+        .height
+        .saturating_sub(label_rows)
+        .saturating_sub(stats_rows);
     if bar_h == 0 {
         return;
     }
@@ -652,6 +693,32 @@ fn render_chart(frame: &mut ratatui::Frame, area: Rect, state: &AppState) {
         draw_bar_column(buf, n_x, bar_bottom, bar_width, units, max, bar_h, cyan, None);
         // $ bar: two-tone (green profit at the bottom, yellow cost on top).
         draw_bar_column(buf, d_x, bar_bottom, bar_width, amount, max, bar_h, yellow, Some((profit, green)));
+
+        // Per-month goal-achievement marker: a green ✔ if the month's achieved
+        // net profit meets that month's net-profit goal, a red ✖ otherwise.
+        // Drawn 2 rows above the taller bar's top, clamped to the chart area so
+        // it stays close to the bar regardless of bar height.
+        let m_goal = state.monthly_goal(g as usize) as f64;
+        let (mark, mark_style) = if mt.profit >= m_goal {
+            ("\u{2714}", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            ("\u{2716}", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        };
+        let n_h = (units / max * bar_h as f64).round() as i64;
+        let total_h_raw = (amount / max * bar_h as f64).round() as i64;
+        let taller_h = n_h.max(total_h_raw).max(0) as u16;
+        // Top y of the taller bar (bar_bottom if height == 0).
+        let bar_top_y = bar_bottom.saturating_sub(taller_h.saturating_sub(1));
+        // 2 rows above the bar top, clamped to >= chart_top.
+        let marker_y = bar_top_y.saturating_sub(2).max(chart_top);
+        let mark_x = group_x + group_width.saturating_sub(1) / 2;
+        if marker_y >= inner.y
+            && marker_y < inner.y + inner.height
+            && mark_x >= inner.x
+            && mark_x < inner.x + inner.width
+        {
+            buf.set_string(mark_x, marker_y, mark, mark_style);
+        }
 
         // Render the numeric value at the base of each bar / region.
         let n_h = (units / max * bar_h as f64).round() as i64;
@@ -2301,13 +2368,13 @@ fn redistribute_month(state: &mut AppState, month: usize, changed_prod: usize, n
     let n = state.products.len();
 
     // Frozen products in this month (locked, excluding the changed one). Their
-    // values carve out a fixed chunk of the 100% pie.
+    // values carve out a fixed chunk of the 1000‰ pie.
     let frozen_sum: i64 = (0..n)
         .filter(|&q| q != changed_prod && !state.editable_in_month(q, month))
         .map(|q| state.monthly_pct[q][month])
         .sum();
 
-    let max_v = (100 - frozen_sum).max(0);
+    let max_v = (PCT_TOTAL - frozen_sum).max(0);
     let v = new_value.clamp(0, max_v);
     state.monthly_pct[changed_prod][month] = v;
 
@@ -2316,7 +2383,7 @@ fn redistribute_month(state: &mut AppState, month: usize, changed_prod: usize, n
         .filter(|&q| q != changed_prod && state.editable_in_month(q, month))
         .collect();
 
-    let remainder = 100 - v - frozen_sum;
+    let remainder = PCT_TOTAL - v - frozen_sum;
     if remainder <= 0 || receivers.is_empty() {
         // No room / no receivers: zero out the non-locked, non-changed products.
         for &q in &receivers {
@@ -2496,16 +2563,9 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
         state.status = Some(export_results(state, lang));
         return false;
     }
-    // Tab: toggle the active region (main content <-> sidebar sliders).
-    if key.code == KeyCode::Tab && !key.modifiers.contains(event::KeyModifiers::SHIFT) {
-        state.active_region = match state.active_region {
-            Region::Main => Region::Sidebar,
-            Region::Sidebar => Region::Main,
-        };
-        return false;
-    }
-    // Shift+Tab (BackTab): switch the main-area sub-tab (Products <-> Graph).
-    if key.code == KeyCode::BackTab {
+    // Tab: switch the main-area sub-tab (Products <-> Graph).  Tab is the
+    // natural "switch tab" key and is never intercepted by the terminal.
+    if key.code == KeyCode::Tab && key.modifiers == event::KeyModifiers::NONE {
         state.tab = match state.tab {
             Tab::Products => Tab::Graph,
             Tab::Graph => Tab::Products,
@@ -2513,6 +2573,29 @@ fn handle_key(state: &mut AppState, key: &KeyEvent, lang: &Lang) -> bool {
         state.selected = 0;
         state.scroll = 0;
         state.rebuild_sliders();
+        return false;
+    }
+    // Shift+Tab (BackTab) or Tab+SHIFT: toggle the active region (main content
+    // <-> sidebar sliders).  BackTab (CSI Z) is the standard encoding used by
+    // virtually every terminal emulator; the Tab+SHIFT fallback covers the few
+    // terminals that report the modifier separately instead of sending CSI Z.
+    if key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(event::KeyModifiers::SHIFT))
+    {
+        state.active_region = match state.active_region {
+            Region::Main => Region::Sidebar,
+            Region::Sidebar => Region::Main,
+        };
+        return false;
+    }
+    // `o` (other): universal fallback to toggle the active region.  This works
+    // in every terminal — including raw Linux VTs where Shift+Tab produces the
+    // same byte as Tab and cannot be distinguished.
+    if key.code == KeyCode::Char('o') {
+        state.active_region = match state.active_region {
+            Region::Main => Region::Sidebar,
+            Region::Sidebar => Region::Main,
+        };
         return false;
     }
     // `[` / `]`: move the top-level period selection left / right
@@ -2654,6 +2737,7 @@ fn sync_settings_from_sliders(state: &mut AppState) {
             SliderKind::MonthWorkdayHours(m) => state.month_overrides.workday[m] = s.value,
             SliderKind::MonthParallel(m) => state.month_overrides.parallel[m] = s.value,
             SliderKind::MonthNetProfit(m) => state.month_overrides.net_profit[m] = s.value,
+            SliderKind::MonthFixCosts(m) => state.month_overrides.fix_costs[m] = s.value,
             _ => {}
         }
     }
@@ -2688,7 +2772,9 @@ fn load_products(folder: &Path, lang: &Lang) -> Vec<(PathBuf, ProductResult)> {
 /// figures — capacity capping is applied separately in
 /// [`AppState::month_totals_for`] for the chart.
 fn month_shares(state: &AppState, m: usize) -> Vec<crate::simulator::ProductShare> {
-    let monthly_goal = state.monthly_goal(m) as f64;
+    // The products must cover the fixed costs on top of the net-profit goal,
+    // so the split target is goal + fix_costs (matching compute_month).
+    let monthly_goal = (state.monthly_goal(m) + state.fix_costs(m)) as f64;
     let raw_pcts: Vec<i64> = (0..state.products.len())
         .map(|i| state.monthly_pct[i][m].max(0))
         .collect();
@@ -2897,22 +2983,24 @@ fn export_results(state: &AppState, lang: &Lang) -> String {
 // State persistence (save / load percentages, locks, and settings)
 // ---------------------------------------------------------------------------
 
-/// Hidden file written in the product folder alongside the export files. Not a
-/// `.txt` file, so [`collect_txt_files`] never picks it up as a product
-/// definition.
-const STATE_FILE_NAME: &str = ".simulation_state";
+/// Non-hidden, plain-text state file written in the product folder alongside
+/// the export files. Its contents are editable by hand (see the header comment
+/// written by [`save_state`]). It is excluded from product loading by
+/// [`collect_txt_files`] (which skips the exact name `simulation_state.txt`).
+const STATE_FILE_NAME: &str = "simulation_state.txt";
 
 fn state_file_path(folder: &Path) -> PathBuf {
     folder.join(STATE_FILE_NAME)
 }
 
 /// Persist the current percentages, locks, settings, and selected month to
-/// `.simulation_state` in the product folder. Called during export so that
+/// `simulation_state.txt` in the product folder. Called during export so that
 /// reopening the app restores the user's custom distribution.
 fn save_state(state: &AppState) {
     let path = state_file_path(&state.folder);
     let mut out = String::new();
-    out.push_str("# tiny-business-simulator state v2\n");
+    out.push_str("# tiny-business-simulator state v3\n");
+    out.push_str("# Percentages are in tenths of a percent (1000 == 100.0%); each month sums to 1000.\n");
     out.push_str("# <file> <pct[0..11]> <mlock[0..11]> <ylock>\n");
 
     for (i, (file, _)) in state.products.iter().enumerate() {
@@ -2956,6 +3044,12 @@ fn save_state(state: &AppState) {
         out.push_str(&state.month_overrides.net_profit[m].to_string());
     }
     out.push('\n');
+    out.push_str("month_fix_costs");
+    for m in 0..12 {
+        out.push(' ');
+        out.push_str(&state.month_overrides.fix_costs[m].to_string());
+    }
+    out.push('\n');
     match state.period {
         Period::FullYear => out.push_str("period FullYear\n"),
         Period::Month(m) => out.push_str(&format!("period Month {}\n", m)),
@@ -2964,8 +3058,8 @@ fn save_state(state: &AppState) {
     let _ = std::fs::write(path, out);
 }
 
-/// State loaded from `.simulation_state`. Fields not present in the file (or
-/// `None` if the file doesn't exist) fall back to defaults.
+/// State loaded from `simulation_state.txt`. Fields not present in the file
+/// (or `None` if the file doesn't exist) fall back to defaults.
 struct LoadedState {
     monthly_pct: Vec<[i64; 12]>,
     month_locked: Vec<[bool; 12]>,
@@ -2975,11 +3069,11 @@ struct LoadedState {
     period: Period,
 }
 
-/// Try to load `.simulation_state` from `folder` and match its per-product
+/// Try to load `simulation_state.txt` from `folder` and match its per-product
 /// entries to the `products` list (by file name). Returns `None` if the file
 /// doesn't exist or contains no usable data. Each month's percentages are
-/// normalized to sum to 100 in case products were added/removed since the
-/// state was saved.
+/// normalized to sum to 1000 (tenths of a percent) in case products were
+/// added/removed since the state was saved.
 fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<LoadedState> {
     let path = state_file_path(folder);
     let content = std::fs::read_to_string(&path).ok()?;
@@ -3068,6 +3162,13 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
             }
             continue;
         }
+        if let Some(rest) = line.strip_prefix("month_fix_costs ") {
+            if let Some(a) = parse_arr12(rest) {
+                month_overrides.fix_costs = a;
+                found_any = true;
+            }
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("period ") {
             let r = rest.trim();
             period = if r == "FullYear" {
@@ -3114,20 +3215,24 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
         if month_overrides.net_profit[m] < mn {
             month_overrides.net_profit[m] = mn;
         }
+        if month_overrides.fix_costs[m] < 0 {
+            month_overrides.fix_costs[m] = 0;
+        }
     }
 
-    // Normalize each month to sum to exactly 100 (products may have been
-    // added/removed since the state was saved).
+    // Normalize each month to sum to exactly PCT_TOTAL (products may have been
+    // added/removed since the state was saved). Values are in tenths of a
+    // percent, so the target sum is 1000.
     for m in 0..12 {
         let sum: i64 = monthly_pct.iter().map(|p| p[m]).sum();
-        if sum != 100 {
+        if sum != PCT_TOTAL {
             if sum > 0 {
                 for i in 0..n {
                     monthly_pct[i][m] =
-                        ((monthly_pct[i][m] as f64 / sum as f64) * 100.0).round() as i64;
+                        ((monthly_pct[i][m] as f64 / sum as f64) * PCT_TOTAL as f64).round() as i64;
                 }
                 let new_sum: i64 = monthly_pct.iter().map(|p| p[m]).sum();
-                let diff = 100 - new_sum;
+                let diff = PCT_TOTAL - new_sum;
                 if diff != 0 && n > 0 {
                     let mut applied = false;
                     for i in 0..n {
@@ -3142,8 +3247,8 @@ fn load_state(folder: &Path, products: &[(PathBuf, ProductResult)]) -> Option<Lo
                     }
                 }
             } else if n > 0 {
-                let base = 100 / n as i64;
-                let extra = 100 - base * n as i64;
+                let base = PCT_TOTAL / n as i64;
+                let extra = PCT_TOTAL - base * n as i64;
                 for i in 0..n {
                     monthly_pct[i][m] = base + if (i as i64) < extra { 1 } else { 0 };
                 }
@@ -3253,6 +3358,16 @@ fn make_settings_slider(kind: SliderKind, state: &AppState) -> Slider {
             suffix: "",
             locked: false,
         },
+        SliderKind::MonthFixCosts(m) => Slider {
+            kind,
+            label: d.tui_slider_month_fix_costs.into(),
+            value: state.month_overrides.fix_costs[m].max(0),
+            min: 0,
+            max: 1_000_000,
+            step: 100,
+            suffix: "",
+            locked: false,
+        },
         _ => Slider {
             kind,
             label: String::new(),
@@ -3281,7 +3396,7 @@ impl AppState {
                         label: format!("% {}", self.products[i].1.name),
                         value: self.yearly_pct(i),
                         min: 0,
-                        max: 100,
+                        max: PCT_TOTAL,
                         step: 1,
                         suffix: "%",
                         locked: self.yearly_locked[i],
@@ -3304,7 +3419,7 @@ impl AppState {
                         label: format!("% {}", self.products[i].1.name),
                         value: self.monthly_pct[i][m],
                         min: 0,
-                        max: 100,
+                        max: PCT_TOTAL,
                         step: 1,
                         suffix: "%",
                         locked: eff_locked,
@@ -3314,6 +3429,7 @@ impl AppState {
                     SliderKind::MonthWorkdayHours(m),
                     SliderKind::MonthParallel(m),
                     SliderKind::MonthNetProfit(m),
+                    SliderKind::MonthFixCosts(m),
                 ] {
                     sliders.push(make_settings_slider(kind, self));
                 }
@@ -3341,8 +3457,10 @@ pub fn run(folder: &Path, lang: &Lang) {
     let loaded = load_state(folder, &products);
 
     // Initial monthly distribution: equal split across products for every month.
-    let base = 100 / n.max(1) as i64;
-    let extra = 100 - base * n.max(1) as i64;
+    // Percentages are stored in tenths of a percent, so the column sum is
+    // PCT_TOTAL (1000 == 100.0%).
+    let base = PCT_TOTAL / n.max(1) as i64;
+    let extra = PCT_TOTAL - base * n.max(1) as i64;
     let default_monthly: Vec<[i64; 12]> = (0..n)
         .map(|i| {
             let v = base + if (i as i64) < extra { 1 } else { 0 };
@@ -3424,7 +3542,57 @@ pub fn run(folder: &Path, lang: &Lang) {
             Err(_) => break,
         };
         if let Event::Key(k) = ev {
-            if k.kind == KeyEventKind::Press && handle_key(&mut state, &k, lang) {
+            if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            // Workaround for terminals / SSH / multiplexers that split escape
+            // sequences across separate reads.  When a bare Esc (0x1B) arrives
+            // alone, it may be the first byte of a multi-byte sequence such as
+            // ESC [ Z (Shift+Tab / BackTab).  Poll briefly; if more data
+            // follows, try to reconstruct the sequence.  If nothing arrives
+            // within the timeout, it is a genuine Esc key press (quit).
+            if k.code == KeyCode::Esc && k.modifiers == event::KeyModifiers::NONE {
+                if event::poll(std::time::Duration::from_millis(10)).unwrap_or(false) {
+                    // More data available — likely a split escape sequence.
+                    // Read the next event and check for the [Z (BackTab) pattern.
+                    if let Ok(Event::Key(k2)) = event::read() {
+                        if k2.kind == KeyEventKind::Press && k2.code == KeyCode::Char('[') {
+                            if event::poll(std::time::Duration::from_millis(10)).unwrap_or(false) {
+                                if let Ok(Event::Key(k3)) = event::read() {
+                                    if k3.kind == KeyEventKind::Press
+                                        && k3.code == KeyCode::Char('Z')
+                                    {
+                                        // Reconstructed ESC [ Z = Shift+Tab.
+                                        let backtab = KeyEvent::new(
+                                            KeyCode::BackTab,
+                                            event::KeyModifiers::SHIFT,
+                                        );
+                                        if handle_key(&mut state, &backtab, lang) {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                    // Not Z — handle k3 as a normal key.
+                                    if handle_key(&mut state, &k3, lang) {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
+                            // Only [ arrived, no third byte — discard.
+                            continue;
+                        }
+                        // Not [ — handle k2 as a normal key (Esc is discarded).
+                        if handle_key(&mut state, &k2, lang) {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                // No more data within 10 ms — genuine Esc key press.
+                break;
+            }
+            if handle_key(&mut state, &k, lang) {
                 break;
             }
         }

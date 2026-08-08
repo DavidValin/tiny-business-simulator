@@ -26,8 +26,9 @@ fn wrap(results: Vec<ProductResult>) -> Vec<(PathBuf, ProductResult)> {
 fn make_state(products: Vec<ProductResult>) -> AppState {
     let n = products.len();
     let wrapped = wrap(products);
-    let base = 100 / n.max(1) as i64;
-    let extra = 100 - base * n.max(1) as i64;
+    // Percentages are stored in tenths of a percent (PCT_TOTAL == 1000).
+    let base = PCT_TOTAL / n.max(1) as i64;
+    let extra = PCT_TOTAL - base * n.max(1) as i64;
     let monthly_pct: Vec<[i64; 12]> = (0..n)
         .map(|i| {
             let v = base + if (i as i64) < extra { 1 } else { 0 };
@@ -97,9 +98,9 @@ fn share_for_month_all_zero_splits_equally() {
 fn yearly_pct_is_mean_of_months() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
-    state.monthly_pct[0][0] = 80;
-    state.monthly_pct[1][0] = 20;
-    let expected: f64 = (80.0 + 11.0 * 50.0) / 12.0;
+    state.monthly_pct[0][0] = 800;
+    state.monthly_pct[1][0] = 200;
+    let expected: f64 = (800.0 + 11.0 * 500.0) / 12.0;
     assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
 }
 
@@ -142,10 +143,10 @@ fn month_totals_differ_per_month() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     set_all_months(&mut state, 8, 1, 1000);
-    state.monthly_pct[0][0] = 80;
-    state.monthly_pct[1][0] = 20;
-    state.monthly_pct[0][1] = 20;
-    state.monthly_pct[1][1] = 80;
+    state.monthly_pct[0][0] = 800;
+    state.monthly_pct[1][0] = 200;
+    state.monthly_pct[0][1] = 200;
+    state.monthly_pct[1][1] = 800;
     let jan = month_shares(&state, 0);
     let feb = month_shares(&state, 1);
     assert_ne!(jan[0].monthly_sales, feb[0].monthly_sales);
@@ -203,7 +204,7 @@ fn slider_track_fills_proportionally() {
 }
 
 #[test]
-fn initial_monthly_percentages_sum_to_100() {
+fn initial_monthly_percentages_sum_to_1000() {
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
@@ -212,29 +213,29 @@ fn initial_monthly_percentages_sum_to_100() {
     let state = make_state(products);
     for m in 0..12 {
         let sum: i64 = state.monthly_pct.iter().map(|p| p[m]).sum();
-        assert_eq!(sum, 100, "month {} sums to {}", m, sum);
+        assert_eq!(sum, PCT_TOTAL, "month {} sums to {}", m, sum);
     }
 }
 
 // --- redistribute_month (within a single month) -------------------------
 
 #[test]
-fn redistribute_month_keeps_total_at_100() {
+fn redistribute_month_keeps_total_at_1000() {
     let products = vec![
         prod("A", 10.0, 5.0, 5.0),
         prod("B", 10.0, 5.0, 5.0),
         prod("C", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
-    state.monthly_pct[0][0] = 50;
-    state.monthly_pct[1][0] = 30;
-    state.monthly_pct[2][0] = 20;
-    redistribute_month(&mut state, 0, 0, 60);
-    assert_eq!(state.monthly_pct[0][0], 60);
-    assert_eq!(state.monthly_pct[1][0], 20);
-    assert_eq!(state.monthly_pct[2][0], 20);
+    state.monthly_pct[0][0] = 500;
+    state.monthly_pct[1][0] = 300;
+    state.monthly_pct[2][0] = 200;
+    redistribute_month(&mut state, 0, 0, 600);
+    assert_eq!(state.monthly_pct[0][0], 600);
+    assert_eq!(state.monthly_pct[1][0], 200);
+    assert_eq!(state.monthly_pct[2][0], 200);
     let sum: i64 = state.monthly_pct.iter().map(|p| p[0]).sum();
-    assert_eq!(sum, 100);
+    assert_eq!(sum, PCT_TOTAL);
 }
 
 #[test]
@@ -245,13 +246,13 @@ fn redistribute_month_includes_zero_products() {
         prod("C", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
-    state.monthly_pct[0][0] = 50;
-    state.monthly_pct[1][0] = 30;
+    state.monthly_pct[0][0] = 500;
+    state.monthly_pct[1][0] = 300;
     state.monthly_pct[2][0] = 0;
-    redistribute_month(&mut state, 0, 0, 60);
-    assert_eq!(state.monthly_pct[0][0], 60);
-    assert_eq!(state.monthly_pct[1][0], 20);
-    assert_eq!(state.monthly_pct[2][0], 20);
+    redistribute_month(&mut state, 0, 0, 600);
+    assert_eq!(state.monthly_pct[0][0], 600);
+    assert_eq!(state.monthly_pct[1][0], 200);
+    assert_eq!(state.monthly_pct[2][0], 200);
 }
 
 #[test]
@@ -262,14 +263,14 @@ fn redistribute_month_freezes_locked_product() {
         prod("C", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
-    state.monthly_pct[0][0] = 50;
-    state.monthly_pct[1][0] = 30;
-    state.monthly_pct[2][0] = 20;
+    state.monthly_pct[0][0] = 500;
+    state.monthly_pct[1][0] = 300;
+    state.monthly_pct[2][0] = 200;
     state.month_locked[1][0] = true;
-    redistribute_month(&mut state, 0, 0, 60);
-    assert_eq!(state.monthly_pct[0][0], 60);
-    assert_eq!(state.monthly_pct[1][0], 30);
-    assert_eq!(state.monthly_pct[2][0], 10);
+    redistribute_month(&mut state, 0, 0, 600);
+    assert_eq!(state.monthly_pct[0][0], 600);
+    assert_eq!(state.monthly_pct[1][0], 300);
+    assert_eq!(state.monthly_pct[2][0], 100);
 }
 
 #[test]
@@ -280,17 +281,17 @@ fn redistribute_month_clamped_by_locked_room() {
         prod("C", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
-    state.monthly_pct[0][0] = 20;
-    state.monthly_pct[1][0] = 30;
-    state.monthly_pct[2][0] = 50;
+    state.monthly_pct[0][0] = 200;
+    state.monthly_pct[1][0] = 300;
+    state.monthly_pct[2][0] = 500;
     state.month_locked[1][0] = true;
     state.month_locked[2][0] = true;
-    redistribute_month(&mut state, 0, 0, 90);
-    assert_eq!(state.monthly_pct[0][0], 20);
-    assert_eq!(state.monthly_pct[1][0], 30);
-    assert_eq!(state.monthly_pct[2][0], 50);
+    redistribute_month(&mut state, 0, 0, 900);
+    assert_eq!(state.monthly_pct[0][0], 200);
+    assert_eq!(state.monthly_pct[1][0], 300);
+    assert_eq!(state.monthly_pct[2][0], 500);
     let sum: i64 = state.monthly_pct.iter().map(|p| p[0]).sum();
-    assert_eq!(sum, 100);
+    assert_eq!(sum, PCT_TOTAL);
 }
 
 #[test]
@@ -309,10 +310,10 @@ fn redistribute_month_yearly_locked_is_frozen() {
     let mut state = make_state(products);
     state.yearly_locked[1] = true;
     let before = state.monthly_pct[1][3];
-    redistribute_month(&mut state, 3, 0, 60);
+    redistribute_month(&mut state, 3, 0, 600);
     assert_eq!(state.monthly_pct[1][3], before);
-    assert_eq!(state.monthly_pct[0][3], 50);
-    assert_eq!(state.monthly_pct[1][3], 50);
+    assert_eq!(state.monthly_pct[0][3], 500);
+    assert_eq!(state.monthly_pct[1][3], 500);
 }
 
 // --- edit_yearly (propagation across all 12 months) ---------------------
@@ -321,12 +322,12 @@ fn redistribute_month_yearly_locked_is_frozen() {
 fn edit_yearly_propagates_to_all_months() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
-    edit_yearly(&mut state, 0, 80);
+    edit_yearly(&mut state, 0, 800);
     for m in 0..12 {
-        assert_eq!(state.monthly_pct[0][m], 80, "month {}", m);
-        assert_eq!(state.monthly_pct[1][m], 20, "month {}", m);
+        assert_eq!(state.monthly_pct[0][m], 800, "month {}", m);
+        assert_eq!(state.monthly_pct[1][m], 200, "month {}", m);
     }
-    assert_eq!(state.yearly_pct(0), 80);
+    assert_eq!(state.yearly_pct(0), 800);
 }
 
 #[test]
@@ -334,16 +335,16 @@ fn edit_yearly_skips_month_locked_months() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     state.month_locked[0][3] = true;
-    edit_yearly(&mut state, 0, 80);
-    assert_eq!(state.monthly_pct[0][3], 50);
+    edit_yearly(&mut state, 0, 800);
+    assert_eq!(state.monthly_pct[0][3], 500);
     for m in 0..12 {
         if m != 3 {
-            assert_eq!(state.monthly_pct[0][m], 80, "month {}", m);
+            assert_eq!(state.monthly_pct[0][m], 800, "month {}", m);
         }
     }
-    let expected: f64 = (11.0 * 80.0 + 50.0) / 12.0;
+    let expected: f64 = (11.0 * 800.0 + 500.0) / 12.0;
     assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
-    assert_ne!(state.yearly_pct(0), 80);
+    assert_ne!(state.yearly_pct(0), 800);
 }
 
 #[test]
@@ -361,8 +362,8 @@ fn monthly_edit_recomputes_yearly_as_mean() {
     let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
     let mut state = make_state(products);
     state.period = Period::Month(0);
-    redistribute_month(&mut state, 0, 0, 80);
-    let expected: f64 = (80.0 + 11.0 * 50.0) / 12.0;
+    redistribute_month(&mut state, 0, 0, 800);
+    let expected: f64 = (800.0 + 11.0 * 500.0) / 12.0;
     assert!((state.yearly_pct(0) as f64 - expected.round()).abs() < 1e-9);
 }
 
@@ -496,8 +497,8 @@ fn export_results_writes_12_monthly_rows_and_totals() {
         paths.push((f, r));
     }
     let n = paths.len();
-    let base = 100 / n as i64;
-    let extra = 100 - base * n as i64;
+    let base = PCT_TOTAL / n as i64;
+    let extra = PCT_TOTAL - base * n as i64;
     let monthly_pct: Vec<[i64; 12]> = (0..n)
         .map(|i| {
             let v = base + if (i as i64) < extra { 1 } else { 0 };
@@ -737,8 +738,8 @@ fn save_then_load_state_roundtrip() {
         paths.push((f, r));
     }
     let n = paths.len();
-    let base = 100 / n as i64;
-    let extra = 100 - base * n as i64;
+    let base = PCT_TOTAL / n as i64;
+    let extra = PCT_TOTAL - base * n as i64;
     let monthly_pct: Vec<[i64; 12]> = (0..n)
         .map(|i| {
             let v = base + if (i as i64) < extra { 1 } else { 0 };
@@ -773,8 +774,8 @@ fn save_then_load_state_roundtrip() {
     state.rebuild_sliders();
 
     // Customize: product 0 = 80%, product 1 = 20% in Jan (month 0).
-    state.monthly_pct[0][0] = 80;
-    state.monthly_pct[1][0] = 20;
+    state.monthly_pct[0][0] = 800;
+    state.monthly_pct[1][0] = 200;
     // Lock product 0 in month 3.
     state.month_locked[0][3] = true;
     // Yearly-lock product 1.
@@ -784,12 +785,13 @@ fn save_then_load_state_roundtrip() {
     state.settings.min_monthly_net_profit = 400;
     state.month_overrides.net_profit[0] = 750;
     state.month_overrides.workday[1] = 10;
+    state.month_overrides.fix_costs[2] = 300;
 
     save_state(&state);
 
     let loaded = load_state(&dir, &paths).expect("state should load");
-    assert_eq!(loaded.monthly_pct[0][0], 80);
-    assert_eq!(loaded.monthly_pct[1][0], 20);
+    assert_eq!(loaded.monthly_pct[0][0], 800);
+    assert_eq!(loaded.monthly_pct[1][0], 200);
     assert!(loaded.month_locked[0][3]);
     assert!(loaded.yearly_locked[1]);
     assert_eq!(loaded.period, Period::Month(3));
@@ -797,6 +799,7 @@ fn save_then_load_state_roundtrip() {
     assert_eq!(loaded.settings.min_monthly_net_profit, 400);
     assert_eq!(loaded.month_overrides.net_profit[0], 750);
     assert_eq!(loaded.month_overrides.workday[1], 10);
+    assert_eq!(loaded.month_overrides.fix_costs[2], 300);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -818,13 +821,13 @@ fn load_state_normalizes_when_product_added() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Save state with 2 products (p0=80, p1=20 in Jan).
+    // Save state with 2 products (p0=80%, p1=20% in Jan).
     std::fs::write(dir.join("p0.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
     std::fs::write(
-        dir.join(".simulation_state"),
-        "p0.txt 80 80 80 80 80 80 80 80 80 80 80 80 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         p1.txt 20 20 20 20 20 20 20 20 20 20 20 20 0 0 0 0 0 0 0 0 0 0 0 0 1\n",
+        dir.join("simulation_state.txt"),
+        "p0.txt 800 800 800 800 800 800 800 800 800 800 800 800 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         p1.txt 200 200 200 200 200 200 200 200 200 200 200 200 0 0 0 0 0 0 0 0 0 0 0 0 1\n",
     )
     .unwrap();
 
@@ -841,11 +844,11 @@ fn load_state_normalizes_when_product_added() {
     std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
 
     let loaded = load_state(&dir, &paths).expect("state should load");
-    assert_eq!(loaded.monthly_pct[0][0], 80);
-    assert_eq!(loaded.monthly_pct[1][0], 20);
+    assert_eq!(loaded.monthly_pct[0][0], 800);
+    assert_eq!(loaded.monthly_pct[1][0], 200);
     assert_eq!(loaded.monthly_pct[2][0], 0);
     let sum: i64 = loaded.monthly_pct.iter().map(|p| p[0]).sum();
-    assert_eq!(sum, 100);
+    assert_eq!(sum, PCT_TOTAL);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -860,10 +863,10 @@ fn load_state_normalizes_when_product_removed() {
     std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
     std::fs::write(
-        dir.join(".simulation_state"),
-        "p0.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         p1.txt 33 33 33 33 33 33 33 33 33 33 33 33 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
-         p2.txt 33 33 33 33 33 33 33 33 33 33 33 33 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        dir.join("simulation_state.txt"),
+        "p0.txt 340 340 340 340 340 340 340 340 340 340 340 340 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         p1.txt 330 330 330 330 330 330 330 330 330 330 330 330 0 0 0 0 0 0 0 0 0 0 0 0 0\n\
+         p2.txt 330 330 330 330 330 330 330 330 330 330 330 330 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
     )
     .unwrap();
 
@@ -879,7 +882,7 @@ fn load_state_normalizes_when_product_removed() {
 
     let loaded = load_state(&dir, &paths).expect("state should load");
     let sum: i64 = loaded.monthly_pct.iter().map(|p| p[0]).sum();
-    assert_eq!(sum, 100, "month must sum to 100 after product removal");
+    assert_eq!(sum, PCT_TOTAL, "month must sum to 1000 after product removal");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -894,10 +897,10 @@ fn load_state_normalizes_when_all_products_locked() {
     std::fs::write(dir.join("p1.txt"), "+ stub\n").unwrap();
     std::fs::write(dir.join("p2.txt"), "+ stub\n").unwrap();
     std::fs::write(
-        dir.join(".simulation_state"),
-        "p0.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 1\n\
-         p1.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 1\n\
-         p2.txt 34 34 34 34 34 34 34 34 34 34 34 34 0 0 0 0 0 0 0 0 0 0 0 0 1\n",
+        dir.join("simulation_state.txt"),
+        "p0.txt 340 340 340 340 340 340 340 340 340 340 340 340 0 0 0 0 0 0 0 0 0 0 0 0 1\n\
+         p1.txt 330 330 330 330 330 330 330 330 330 330 330 330 0 0 0 0 0 0 0 0 0 0 0 0 1\n\
+         p2.txt 330 330 330 330 330 330 330 330 330 330 330 330 0 0 0 0 0 0 0 0 0 0 0 0 1\n",
     )
     .unwrap();
 
@@ -916,8 +919,8 @@ fn load_state_normalizes_when_all_products_locked() {
     for m in 0..12 {
         let sum: i64 = loaded.monthly_pct.iter().map(|p| p[m]).sum();
         assert_eq!(
-            sum, 100,
-            "month {} must sum to 100 even when all products are locked, got {}",
+            sum, PCT_TOTAL,
+            "month {} must sum to 1000 even when all products are locked, got {}",
             m, sum
         );
     }
@@ -1220,7 +1223,7 @@ fn export_results_contains_correct_numeric_values() {
     let paths = vec![(f, r)];
 
     let n = 1;
-    let monthly_pct = vec![[100i64; 12]];
+    let monthly_pct = vec![[PCT_TOTAL; 12]];
     let mut state = AppState {
         products: paths,
         folder: dir.clone(),
@@ -1268,7 +1271,7 @@ fn export_results_contains_correct_numeric_values() {
     assert!(totals_file.contains("1800"), "missing total annual sales 1800");
 
     // The state file was saved.
-    assert!(dir.join(".simulation_state").exists(), "state file not saved");
+    assert!(dir.join("simulation_state.txt").exists(), "state file not saved");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1285,16 +1288,16 @@ fn redistribute_month_setting_zero_distributes_to_others() {
         prod("C", 10.0, 5.0, 5.0),
     ];
     let mut state = make_state(products);
-    state.monthly_pct[0][0] = 40;
-    state.monthly_pct[1][0] = 30;
-    state.monthly_pct[2][0] = 30;
+    state.monthly_pct[0][0] = 400;
+    state.monthly_pct[1][0] = 300;
+    state.monthly_pct[2][0] = 300;
     redistribute_month(&mut state, 0, 0, 0);
     assert_eq!(state.monthly_pct[0][0], 0);
     let sum: i64 = state.monthly_pct.iter().map(|p| p[0]).sum();
-    assert_eq!(sum, 100);
-    // B and C split the 100 equally (50/50).
-    assert_eq!(state.monthly_pct[1][0], 50);
-    assert_eq!(state.monthly_pct[2][0], 50);
+    assert_eq!(sum, PCT_TOTAL);
+    // B and C split the 1000 equally (500/500).
+    assert_eq!(state.monthly_pct[1][0], 500);
+    assert_eq!(state.monthly_pct[2][0], 500);
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,4 +1320,162 @@ fn word_wrap_hard_splits_long_words() {
 fn word_wrap_empty_returns_empty_line() {
     let lines = word_wrap("", 10);
     assert_eq!(lines, vec![""]);
+}
+
+// ---------------------------------------------------------------------------
+// Fix costs (per-month fixed cost slider)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fix_costs_increase_required_sales_and_reduce_profit() {
+    // With sufficient capacity, adding fix costs raises the required sales
+    // (target = goal + fix) but the achieved net profit stays at the goal
+    // (profit = sales*net - fix = goal).
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 1, 1000);
+    state.period = Period::Month(0);
+
+    // No fix costs: required sales = ceil(1000/5) = 200, profit = 1000.
+    let s0 = month_shares(&state, 0);
+    assert_eq!(s0[0].monthly_sales, 200);
+    let mt0 = state.month_totals_for(0);
+    assert!((mt0.profit - 1000.0).abs() < 1e-9);
+
+    // Add fix costs 500: target = 1500, required sales = ceil(1500/5) = 300,
+    // profit = 300*5 - 500 = 1000 (goal still met).
+    state.month_overrides.fix_costs[0] = 500;
+    let s1 = month_shares(&state, 0);
+    assert_eq!(s1[0].monthly_sales, 300);
+    let mt1 = state.month_totals_for(0);
+    assert!((mt1.profit - 1000.0).abs() < 1e-9, "profit was {}", mt1.profit);
+}
+
+#[test]
+fn fix_costs_can_make_goal_unmet_under_capacity() {
+    // Under capacity capping, fix costs reduce the achieved net profit below
+    // the goal (and can even make it negative).
+    let products = vec![prod("A", 10.0, 5.0, 60.0)];
+    let mut state = make_state(products);
+    state.settings.min_workday_hours = 1;
+    set_all_months(&mut state, 1, 1, 1000);
+    state.period = Period::Month(0);
+    // capacity = 1*22*60 = 1320 min.
+    // Without fix: sales = ceil(1000/5) = 200, minutes = 12000 -> capped 22,
+    // profit = 22*5 = 110.
+    let mt0 = state.month_totals_for(0);
+    assert!((mt0.profit - 110.0).abs() < 1e-9, "profit was {}", mt0.profit);
+
+    // Add fix costs 500: target = 1500, sales = ceil(1500/5) = 300,
+    // minutes = 18000, scale = 1320/18000, capped = floor(300*0.0733..) = 22,
+    // profit = 22*5 - 500 = -390 < goal 1000.
+    state.month_overrides.fix_costs[0] = 500;
+    let mt1 = state.month_totals_for(0);
+    assert!(mt1.profit < 1000.0, "goal should not be met, profit = {}", mt1.profit);
+    assert!(mt1.profit < 0.0, "profit should be negative, got {}", mt1.profit);
+}
+
+#[test]
+fn fix_costs_persist_in_state_roundtrip() {
+    let dir = std::env::temp_dir().join("tui_state_fix_costs_roundtrip");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let f = dir.join("p0.txt");
+    std::fs::write(&f, "+ stub\n").unwrap();
+    let paths = vec![(f, products.into_iter().next().unwrap())];
+    let mut state = make_state(vec![prod("A", 10.0, 5.0, 5.0)]);
+    state.folder = dir.clone();
+    state.products = paths.clone();
+    state.month_overrides.fix_costs[3] = 750;
+    save_state(&state);
+
+    let loaded = load_state(&dir, &paths).expect("state should load");
+    assert_eq!(loaded.month_overrides.fix_costs[3], 750);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Graph goal-achievement tick / cross markers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn graph_renders_tick_for_met_goal_and_cross_for_unmet() {
+    use ratatui::backend::TestBackend;
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    set_all_months(&mut state, 8, 1, 1000);
+    // Month 0: capacity sufficient -> profit = 1000 = goal -> ✔.
+    // Month 1: huge fix costs -> capacity-capped profit < goal -> ✖.
+    state.month_overrides.fix_costs[1] = 10000;
+    state.tab = Tab::Graph;
+    state.period = Period::FullYear;
+    state.rebuild_sliders();
+    update_parallel_range(&mut state);
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &mut state)).unwrap();
+    let buf = terminal.backend().buffer().clone();
+
+    let has_tick = (0..buf.area.height).any(|y| {
+        (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "\u{2714}")
+    });
+    let has_cross = (0..buf.area.height).any(|y| {
+        (0..buf.area.width).any(|x| buf[(x, y)].symbol() == "\u{2716}")
+    });
+    assert!(has_tick, "no green tick rendered for a met-goal month");
+    assert!(has_cross, "no red cross rendered for an unmet-goal month");
+}
+
+// ---------------------------------------------------------------------------
+// Percentage sliders step by 0.1% (stored in tenths)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn percent_sliders_step_in_tenths_and_display_one_decimal() {
+    let products = vec![prod("A", 10.0, 5.0, 5.0), prod("B", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    state.period = Period::Month(0);
+    state.rebuild_sliders();
+    let pct_slider = state
+        .sliders
+        .iter()
+        .find(|s| matches!(s.kind, SliderKind::MonthPercent(0)))
+        .unwrap();
+    // Default equal split = 500 (= 50.0%), max is 1000 (= 100.0%), step 1.
+    assert_eq!(pct_slider.value, 500);
+    assert_eq!(pct_slider.max, PCT_TOTAL);
+    assert_eq!(pct_slider.step, 1);
+    // The readout shows one decimal place.
+    let readout = slider_readout(pct_slider, &state.lang);
+    assert!(readout.contains("50.0%"), "readout was: {}", readout);
+}
+
+#[test]
+fn state_file_is_not_hidden_txt() {
+    // The state file name is a non-hidden, plain-text file.
+    assert_eq!(STATE_FILE_NAME, "simulation_state.txt");
+    assert!(!STATE_FILE_NAME.starts_with('.'));
+    assert!(STATE_FILE_NAME.ends_with(".txt"));
+}
+
+#[test]
+fn collect_txt_files_ignores_state_file() {
+    use crate::simulator::collect_txt_files;
+    let dir = std::env::temp_dir().join("tui_collect_ignores_state");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("beer.txt"), "+ Beer : 2.7 USD : 0.2 mins\n").unwrap();
+    std::fs::write(dir.join("simulation_state.txt"), "# state\n").unwrap();
+    std::fs::write(dir.join("beer.simulation_results.txt"), "results\n").unwrap();
+    let files = collect_txt_files(&dir);
+    let names: Vec<String> = files
+        .iter()
+        .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, vec!["beer.txt".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
 }

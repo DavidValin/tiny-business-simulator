@@ -970,7 +970,6 @@ fn render_product_details_full_year(frame: &mut ratatui::Frame, area: Rect, stat
 
     frame.render_widget(
         Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
             .scroll((state.product_scroll as u16, 0)),
         text_area,
     );
@@ -1106,7 +1105,6 @@ fn render_product_details_month(
 
     frame.render_widget(
         Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
             .scroll((state.product_scroll as u16, 0)),
         text_area,
     );

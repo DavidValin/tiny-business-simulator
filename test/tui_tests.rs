@@ -1187,15 +1187,36 @@ fn yearly_ref_check_matches_sum_of_monthly_goals() {
     let mut state = make_state(products);
     // Default min_monthly_net_profit = 500 -> 12 * 500 = 6000.
     state.settings.target_yearly_net_profit = 6000;
-    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m)).sum();
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m) + state.fix_costs(m)).sum();
     assert_eq!(year_sum, 6000);
     assert!(year_sum >= state.settings.target_yearly_net_profit);
 
     // Lower the target -> check passes (sum >= target).
     // Raise the target above 6000 -> check fails.
     state.settings.target_yearly_net_profit = 7000;
-    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m)).sum();
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m) + state.fix_costs(m)).sum();
     assert!(year_sum < state.settings.target_yearly_net_profit);
+}
+
+#[test]
+fn yearly_ref_sum_includes_monthly_fix_costs() {
+    // The 12x-mo sum must include each month's fix costs, not just the raw
+    // net-profit goal, since fix costs are part of the burden the products
+    // have to cover.
+    let products = vec![prod("A", 10.0, 5.0, 5.0)];
+    let mut state = make_state(products);
+    // Default min_monthly_net_profit = 500 -> 12 * 500 = 6000 with no fix costs.
+    state.settings.target_yearly_net_profit = 6500;
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m) + state.fix_costs(m)).sum();
+    assert_eq!(year_sum, 6000);
+    assert!(year_sum < state.settings.target_yearly_net_profit);
+
+    // Add 500 of fix costs to a single month -> sum rises to 6500 and now
+    // meets the target.
+    state.month_overrides.fix_costs[0] = 500;
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m) + state.fix_costs(m)).sum();
+    assert_eq!(year_sum, 6500);
+    assert!(year_sum >= state.settings.target_yearly_net_profit);
 }
 
 // ---------------------------------------------------------------------------

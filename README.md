@@ -116,10 +116,12 @@ achieved net profit ≥ the month's goal, a red ✖ otherwise, followed by the g
 value.
 
 The `Yearly ref` block compares the sum of the 12 monthly net-profit goals
-against the `target yearly net profit`:
+(each including that month's `fix costs`) against the `target yearly net
+profit`:
 
   * `12x mo` — sum of the 12 monthly net-profit goals (each month's override,
-    else the global `min. monthly net profit`).
+    else the global `min. monthly net profit`) **plus** each month's `fix
+    costs`.
   * ✔ / ✖ + `goal` — green ✔ if that sum meets the `target yearly net profit`,
     red ✖ otherwise, followed by the target value. The `target yearly net
     profit` is only a reference; the yearly total is the **sum** of the 12

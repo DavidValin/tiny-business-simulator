@@ -1986,9 +1986,10 @@ fn build_totals_columns(state: &AppState) -> (Vec<Line<'static>>, Vec<Line<'stat
         ]
     };
 
-    // Yearly reference: sum of the 12 monthly net-profit goals vs the target
-    // yearly net profit.
-    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m)).sum();
+    // Yearly reference: sum of the 12 monthly net-profit goals, each including
+    // that month's fix costs (the actual burden the products must cover), vs
+    // the target yearly net profit.
+    let year_sum: i64 = (0..12).map(|m| state.monthly_goal(m) + state.fix_costs(m)).sum();
     let yearly_target = state.settings.target_yearly_net_profit;
     let (mark, mark_style) = if year_sum >= yearly_target {
         ("\u{2714}", Style::default().fg(Color::Green))
